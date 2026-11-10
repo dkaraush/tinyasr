@@ -887,11 +887,21 @@ impl Model {
             norm: BiasNorm::load(&mut w, "encoder_embed.out_norm"),
         };
         use crate::Lang;
-        // the language set by its size (the file has no codes): the two models trained so far
-        let langs = match w.c("n_langs") {
-            3 => alloc::vec![Lang::En, Lang::Ru, Lang::Uk],
-            4 => alloc::vec![Lang::En, Lang::Es, Lang::It, Lang::Pt],
-            _ => return Err("unknown language set"),
+        // the language set: "lang.K" = Lang index of the K-th language (files from en-ru-uz on); older files by its size
+        let n = w.c("n_langs");
+        let langs = if w.cfg.contains_key("lang.0") {
+            let mut v = alloc::vec::Vec::new();
+            for k in 0..n {
+                let i = *w.cfg.get(&alloc::format!("lang.{k}")).ok_or("missing language code")? as usize;
+                v.push(*Lang::ALL.get(i).ok_or("unknown language code")?);
+            }
+            v
+        } else {
+            match n {
+                3 => alloc::vec![Lang::En, Lang::Ru, Lang::Uk],
+                4 => alloc::vec![Lang::En, Lang::Es, Lang::It, Lang::Pt],
+                _ => return Err("unknown language set"),
+            }
         };
         let le = w.vec("lang_embed.weight");
         let d0 = stacks[0].dim;

@@ -65,13 +65,14 @@ pub enum Lang {
     Es = 3,
     It = 4,
     Pt = 5,
+    Uz = 6,
 }
 
 impl Lang {
-    pub const ALL: [Lang; 6] = [Lang::En, Lang::Ru, Lang::Uk, Lang::Es, Lang::It, Lang::Pt];
+    pub const ALL: [Lang; 7] = [Lang::En, Lang::Ru, Lang::Uk, Lang::Es, Lang::It, Lang::Pt, Lang::Uz];
 
     pub fn code(self) -> &'static str {
-        ["en", "ru", "uk", "es", "it", "pt"][self as usize]
+        ["en", "ru", "uk", "es", "it", "pt", "uz"][self as usize]
     }
 
     pub fn from_code(c: &str) -> Option<Lang> {
@@ -134,7 +135,7 @@ impl Models {
         })
     }
 
-    /// The languages of the recognizer: en, ru, uk or en, es, it, pt.
+    /// The languages of the recognizer: en, ru, uk; en, es, it, pt; or en, ru, uz.
     pub fn langs(&self) -> &[Lang] {
         &self.asr.langs
     }
