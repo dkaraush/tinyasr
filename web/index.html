@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tinyasr on device</title>
+<style>
+:root {
+  --bg: #f6f6f4; --surface: #ffffff; --text: #1c1c1a; --muted: #6b6b66; --faint: #a3a39d; --line: #e4e3df;
+  --accent: #2f6fde; --live: #c23b2b; --hl: #fff1b8;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #151514; --surface: #1e1e1c; --text: #ececea; --muted: #a3a39d; --faint: #6b6b66; --line: #2e2e2b;
+          --accent: #6b9cf0; --live: #e06a5b; --hl: #4a4220; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 860px; margin: 0 auto; padding: 24px 16px 64px; }
+h1 { font-size: 20px; font-weight: 600; margin: 0 0 2px; }
+a { color: var(--accent); }
+.sub { color: var(--muted); font-size: 13px; }
+.bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 18px 0 12px; }
+button, select, label.file { max-width: 100%; font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 7px 12px; }
+button, label.file { cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.on { background: var(--live); border-color: var(--live); color: #fff; }
+button:disabled, select:disabled { opacity: .5; cursor: default; }
+label.file input { display: none; }
+#status { color: var(--muted); font-size: 13px; min-height: 20px; margin: 8px 0; }
+#player { width: 100%; margin: 8px 0; display: none; max-height: 360px; border-radius: 8px; }
+#dl { position: sticky; top: 0; z-index: 5; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; margin: 8px 0; font-size: 14px; }
+#out { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; min-height: 200px;
+       max-height: 60vh; overflow-y: auto; font-size: 17px; line-height: 1.6; white-space: pre-wrap; }
+.tail { color: var(--muted); }
+.w.click { cursor: pointer; border-radius: 3px; }
+.w.now { background: var(--hl); }
+.empty { color: var(--faint); font-size: 15px; }
+progress { width: 160px; height: 8px; vertical-align: middle; }
+</style>
+</head>
+<body>
+<main>
+  <h1>tinyasr on device</h1>
+  <div class="sub">Speech recognition running in this page (WebAssembly): no audio leaves the device.
+    <a href="https://github.com/dkaraush/tinyasr">tinyasr</a></div>
+  <div class="bar">
+    <button id="mic" class="primary" disabled>● Record</button>
+    <select id="model" disabled></select>
+    <select id="lang" disabled></select>
+    <label class="file" id="filebtn">Transcribe a file…<input type="file" id="file" accept="audio/*,video/*" disabled></label>
+    <button id="clear" disabled>Clear</button>
+  </div>
+  <div id="dl" hidden></div>
+  <div id="status">Loading…</div>
+  <video id="player" controls></video>
+  <div id="out"><span class="empty">Transcript appears here. Record, or drop an audio or video file on the page.</span></div>
+</main>
+
+<script id="worker-src" type="text/plain">
+// Recognition worker: tinyasr (WebAssembly), one Models per downloaded model, one Session per recording. All the
+// session logic (streaming pass, re-decodes, Silero VAD, end of turn) is in the library; this only moves bytes and JSON.
+let x = null;
+const models = {};  // file -> tinyasr_models pointer
+let S = 0, M = 0;
+const mem = () => new Uint8Array(x.memory.buffer);
+function put(b) { const p = x.tinyasr_alloc(b.length); mem().set(b, p); return [p, b.length]; }
+function cstr(s) { return put(new TextEncoder().encode(s + "\0")); }
+function str(p) { if (!p) return null; const m = mem(); let e = p; while (m[e]) e++; return new TextDecoder().decode(m.slice(p, e)); }
+function free([p, n]) { x.tinyasr_dealloc(p, n); }
+function withPcm(a, f) {
+  const p = x.tinyasr_alloc(a.length * 4);
+  new Float32Array(x.memory.buffer, p, a.length).set(a);
+  try { return f(p); } finally { x.tinyasr_dealloc(p, a.length * 4); }
+}
+let vad = null;
+
+function load(file, buf) {
+  if (models[file]) return;
+  const a = put(new Uint8Array(buf)), v = put(vad), err = x.tinyasr_alloc(256);
+  const m = x.tinyasr_load(a[0], a[1], v[0], v[1], err, 256);
+  free(a); free(v);
+  const e = str(err); x.tinyasr_dealloc(err, 256);
+  if (!m) throw new Error(e || "could not load " + file);
+  models[file] = m;
+}
+function stop() {
+  if (!S) return;
+  postMessage({ type: "events", ev: JSON.parse(str(x.tinyasr_session_finish(S))) });
+  x.tinyasr_session_free(S); S = 0;
+}
+
+onmessage = ev => {
+  const m = ev.data;
+  try {
+    if (m.type === "init") {
+      x = new WebAssembly.Instance(new WebAssembly.Module(m.wasm), { env: { now: () => performance.now() / 1000 } }).exports;
+      vad = new Uint8Array(m.vad);
+      postMessage({ type: "ready" });
+    } else if (m.type === "model") {
+      const t = performance.now();
+      load(m.file, m.buf);
+      postMessage({ type: "loaded", file: m.file, ms: performance.now() - t });
+    } else if (m.type === "start") {
+      stop();
+      M = models[m.file];
+      const l = cstr(m.langs), s0 = m.start ? cstr(m.start) : null;
+      S = x.tinyasr_session_new(M, l[0], s0 ? s0[0] : 0, x.tinyasr_clock());
+      free(l); if (s0) free(s0);
+    } else if (m.type === "audio") {
+      if (S) postMessage({ type: "events", ev: JSON.parse(str(withPcm(m.x, p => x.tinyasr_session_push(S, p, m.x.length)))) });
+    } else if (m.type === "stop") {
+      stop(); postMessage({ type: "stopped" });
+    } else if (m.type === "file") {
+      stop();
+      const t = performance.now(), l = cstr(m.langs);
+      const f = withPcm(m.x, p => x.tinyasr_file_new(models[m.file], p, m.x.length, l[0]));
+      free(l);
+      for (let r; (r = x.tinyasr_file_next(f));) {
+        postMessage({ type: "events", ev: [{ type: "commit", words: JSON.parse(str(r)) }] });
+        postMessage({ type: "progress", done: x.tinyasr_file_progress(f), lang: str(x.tinyasr_file_lang(f)) });
+      }
+      const lang = str(x.tinyasr_file_lang(f));
+      x.tinyasr_file_free(f);
+      postMessage({ type: "filedone", rtf: (performance.now() - t) / 1000 / (m.x.length / 16000), lang });
+    }
+  } catch (err) { postMessage({ type: "error", text: String(err && err.stack || err) }); }
+};
+</script>
+
+<script>
+const $ = id => document.getElementById(id);
+const status = s => $("status").innerHTML = s;
+const esc = s => String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+
+// models next to the page (repository root: models/); downloaded on first use
+const BASE = "../models/";
+const MODELS = [
+  { file: "en-ru-uk.tzf", name: "English, Russian, Ukrainian", langs: ["en", "ru", "uk"], mb: 35.9 },
+  { file: "en-es-it-pt.tzf", name: "English, Spanish, Italian, Portuguese", langs: ["en", "es", "it", "pt"], mb: 36.9 },
+];
+const NAMES = { en: "English", ru: "Русский", uk: "Українська", es: "Español", it: "Italiano", pt: "Português" };
+
+let worker, recording = null, fileMode = false, ready = false;
+let frozen = [], openW = [], tail = [];
+const loaded = {}, loading = {};
+
+function fillLangs() {
+  const M = MODELS[+$("model").value], keep = $("lang").value;
+  $("lang").innerHTML = `<option value="">Language: auto (the model picks)</option>` +
+    M.langs.map(l => `<option value="${l}">${NAMES[l]}</option>`).join("");
+  const ui = (navigator.language || "en").slice(0, 2);
+  $("lang").value = M.langs.includes(keep) ? keep : M.langs.includes(ui) ? ui : "";
+}
+
+async function boot() {
+  for (const [i, M] of MODELS.entries()) $("model").insertAdjacentHTML("beforeend", `<option value="${i}">${esc(M.name)}</option>`);
+  const ui = (navigator.language || "en").slice(0, 2);
+  $("model").value = Math.max(0, MODELS.findIndex(M => M.langs.includes(ui) && ui !== "en"));
+  fillLangs();
+  const [wasm, vad] = await Promise.all(["tinyasr.wasm", BASE + "silero_vad.onnx"].map(async u => {
+    const r = await fetch(u); if (!r.ok) throw new Error(`${u}: ${r.status}`); return r.arrayBuffer();
+  }));
+  worker = new Worker(URL.createObjectURL(new Blob([$("worker-src").textContent], { type: "text/javascript" })));
+  worker.onmessage = onWorker;
+  worker.postMessage({ type: "init", wasm, vad }, [wasm, vad]);
+}
+
+// download a model (with progress) and hand it to the worker; resolves once it is loaded there
+function getModel(i) {
+  const M = MODELS[i];
+  if (loaded[M.file]) return Promise.resolve();
+  if (loading[M.file]) return loading[M.file].p;
+  let done; const p = new Promise(r => done = r); loading[M.file] = { p, done };
+  (async () => {
+    const dl = $("dl"); dl.hidden = false;
+    const show = (a, b) => dl.innerHTML = `Downloading the ${esc(M.name)} model… <progress value="${a}" max="${b || 1}"></progress> ${(a / 1e6).toFixed(1)} / ${(b / 1e6).toFixed(1)} MB`;
+    try {
+      const r = await fetch(BASE + M.file);
+      if (!r.ok) throw new Error(r.status + " " + r.statusText);
+      const total = +r.headers.get("content-length") || M.mb * 1e6, rd = r.body.getReader(), parts = [];
+      let got = 0; show(0, total);
+      for (;;) { const { done, value } = await rd.read(); if (done) break; parts.push(value); got += value.length; show(got, total); }
+      dl.innerHTML = `Loading the ${esc(M.name)} model…`;
+      const buf = await new Blob(parts).arrayBuffer();
+      worker.postMessage({ type: "model", file: M.file, buf }, [buf]);
+    } catch (err) { dl.innerHTML = `Could not download ${esc(BASE + M.file)}: ${esc(err.message)}`; }
+  })();
+  return p;
+}
+
+function spans(ws) {
+  return ws.map(w => fileMode ? `<span class="w click" data-t="${w.start.toFixed(2)}">${esc(w.text)}</span>` : esc(w.text)).join(" ");
+}
+let follow = true;
+$("out").addEventListener("scroll", () => { const o = $("out"); follow = o.scrollTop + o.clientHeight >= o.scrollHeight - 40; });
+const frozenEl = document.createElement("span"), openEl = document.createElement("span"), tailEl = document.createElement("span");
+tailEl.className = "tail";
+function show() {
+  const out = $("out");
+  if (!frozen.length && !openW.length && !tail.length) { out.innerHTML = '<span class="empty">Transcript appears here. Record, or drop an audio or video file on the page.</span>'; return; }
+  if (!out.contains(frozenEl)) { out.innerHTML = ""; out.append(frozenEl, openEl, tailEl); }
+  openEl.innerHTML = (frozen.length && openW.length ? " " : "") + spans(openW);
+  tailEl.innerHTML = tail.length ? ((frozen.length || openW.length) ? " " : "") + spans(tail) : "";
+  if (follow) out.scrollTop = out.scrollHeight;
+}
+function clearText() { frozen = []; openW = []; tail = []; frozenEl.innerHTML = ""; show(); }
+
+let rtfHint = "";
+function onWorker(ev) {
+  const m = ev.data;
+  if (m.type === "ready") {
+    ready = true; ["mic", "model", "lang", "clear", "file"].forEach(id => $(id).disabled = false);
+    status("Ready. The speech model downloads when you first use it (about 36 MB).");
+  } else if (m.type === "loaded") {
+    loaded[m.file] = true; $("dl").hidden = true; loading[m.file].done();
+  } else if (m.type === "error") {
+    status("Error: " + esc(m.text));
+  } else if (m.type === "events") {
+    for (const e of m.ev) {
+      if (e.type === "commit") {
+        frozenEl.insertAdjacentHTML("beforeend", (frozen.length ? " " : "") + spans(e.words));
+        frozen.push(...e.words); openW = []; tail = [];
+      } else if (e.type === "partial") { openW = e.open; tail = e.tail; }
+      else if (e.type === "language" && recording) status(`Listening… language: ${NAMES[e.lang] || e.lang}`);
+    }
+    show();
+  } else if (m.type === "progress") {
+    status(`Transcribing… <progress value="${m.done}" max="1"></progress> ${(100 * m.done).toFixed(0)}%`);
+  } else if (m.type === "filedone") {
+    status(`Done (${NAMES[m.lang] || m.lang}): ${(1 / m.rtf).toFixed(1)}× faster than real time on this device. Click a word to play from it.`);
+    busy(false);
+  }
+}
+function busy(b) { ["mic", "model", "lang", "file"].forEach(id => $(id).disabled = b); }
+function langs() { const M = MODELS[+$("model").value]; return $("lang").value || M.langs.join(","); }
+
+$("model").onchange = fillLangs;
+$("mic").onclick = async () => {
+  if (recording) { stopMic(); return; }
+  fileMode = false; $("player").style.display = "none";
+  const mi = +$("model").value;
+  busy(true);
+  try {
+    if (!loaded[MODELS[mi].file]) status("Downloading the model…");
+    await getModel(mi);
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+    const ctx = new AudioContext({ sampleRate: 16000 });
+    const proc = `class P extends AudioWorkletProcessor{constructor(){super();this.b=[];this.n=0}process(i){const c=i[0][0];if(c){this.b.push(c.slice());this.n+=c.length;if(this.n>=640){const o=new Float32Array(this.n);let k=0;for(const x of this.b){o.set(x,k);k+=x.length}this.port.postMessage(o,[o.buffer]);this.b=[];this.n=0}}return true}}registerProcessor("p",P)`;
+    await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([proc], { type: "text/javascript" })));
+    const src = ctx.createMediaStreamSource(stream), node = new AudioWorkletNode(ctx, "p");
+    node.port.onmessage = ev => worker.postMessage({ type: "audio", x: ev.data }, [ev.data.buffer]);
+    src.connect(node);
+    if (frozen.length || openW.length) frozenEl.insertAdjacentHTML("beforeend", "\n\n");  // a new recording, a new paragraph
+    worker.postMessage({ type: "start", file: MODELS[mi].file, langs: langs(), start: $("lang").value || (navigator.language || "en").slice(0, 2) });
+    recording = { stream, ctx };
+    $("mic").disabled = false; $("mic").textContent = "■ Stop"; $("mic").classList.add("on");
+    status("Listening…");
+  } catch (err) { busy(false); status("Microphone: " + esc(err.message)); }
+};
+function stopMic() {
+  const r = recording; recording = null;
+  r.stream.getTracks().forEach(t => t.stop()); r.ctx.close();
+  worker.postMessage({ type: "stop" });
+  $("mic").textContent = "● Record"; $("mic").classList.remove("on"); busy(false);
+  status("Stopped.");
+}
+
+async function transcribeFile(f) {
+  if (!ready) return;
+  if (recording) stopMic();
+  fileMode = true; clearText();
+  const pl = $("player"); pl.src = URL.createObjectURL(f); pl.style.display = "block";
+  const video = f.type.startsWith("video");
+  pl.style.height = video ? "" : "54px"; pl.style.background = video ? "#000" : "transparent";
+  busy(true);
+  try {
+    const mi = +$("model").value;
+    status(`Decoding ${esc(f.name)}…`);
+    const tmp = new AudioContext(), dec = await tmp.decodeAudioData(await f.arrayBuffer()); tmp.close();
+    const off = new OfflineAudioContext(1, Math.ceil(dec.duration * 16000), 16000);
+    const s = off.createBufferSource(); s.buffer = dec; s.connect(off.destination); s.start();
+    const x = (await off.startRendering()).getChannelData(0).slice();
+    await getModel(mi);
+    status("Transcribing…");
+    worker.postMessage({ type: "file", file: MODELS[mi].file, x, langs: langs() }, [x.buffer]);
+  } catch (err) { busy(false); status("Could not decode the file: " + esc(err.message)); }
+}
+$("file").onchange = () => $("file").files[0] && transcribeFile($("file").files[0]);
+document.addEventListener("dragover", ev => ev.preventDefault());
+document.addEventListener("drop", ev => { ev.preventDefault(); ev.dataTransfer.files[0] && transcribeFile(ev.dataTransfer.files[0]); });
+$("clear").onclick = clearText;
+$("out").addEventListener("click", ev => {
+  const w = ev.target.closest(".w.click"); if (!w) return;
+  $("player").currentTime = +w.dataset.t; $("player").play();
+});
+$("player").addEventListener("timeupdate", () => {
+  const t = $("player").currentTime; let cur = null;
+  document.querySelectorAll(".w.click").forEach(w => { w.classList.remove("now"); if (+w.dataset.t <= t) cur = w; });
+  if (cur) cur.classList.add("now");
+});
+
+boot().catch(err => status("Failed to start: " + esc(err.message)));
+</script>
+</body>
+</html>
