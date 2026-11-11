@@ -217,7 +217,7 @@ pub unsafe extern "C" fn tinyasr_session_free(s: *mut CSession) {
 }
 
 fn lang_str(l: Lang) -> *const c_char {
-    [c"en", c"ru", c"uk", c"es", c"it", c"pt", c"uz"][l as usize].as_ptr()
+    [c"en", c"ru", c"uk", c"es", c"it", c"pt", c"uz", c"fa"][l as usize].as_ptr()
 }
 
 /// A recorded file (n samples, 16 kHz, copied): VAD runs here. `langs` as for sessions.

@@ -29,7 +29,7 @@ label.file input { display: none; }
 #status { color: var(--muted); font-size: 13px; min-height: 20px; margin: 8px 0; }
 #player { width: 100%; margin: 8px 0; display: none; max-height: 360px; border-radius: 8px; }
 #dl { position: sticky; top: 0; z-index: 5; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; margin: 8px 0; font-size: 14px; }
-#out { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; min-height: 200px;
+#out { unicode-bidi: plaintext; text-align: start; /* Persian lines right-to-left, each line by its own text */ background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; min-height: 200px;
        max-height: 60vh; overflow-y: auto; font-size: 17px; line-height: 1.6; white-space: pre-wrap; }
 .tail { color: var(--muted); }
 .w.click { cursor: pointer; border-radius: 3px; }
@@ -139,8 +139,9 @@ const MODELS = [
   { file: "en-ru-uk.tzf", name: "English, Russian, Ukrainian", langs: ["en", "ru", "uk"], mb: 35.9 },
   { file: "en-es-it-pt.tzf", name: "English, Spanish, Italian, Portuguese", langs: ["en", "es", "it", "pt"], mb: 36.9 },
   { file: "en-ru-uz.tzf", name: "English, Russian, Uzbek", langs: ["en", "ru", "uz"], mb: 35.7 },
+  { file: "en-fa.tzf", name: "English, Persian", langs: ["en", "fa"], mb: 34.6 },
 ];
-const NAMES = { en: "English", ru: "Русский", uk: "Українська", es: "Español", it: "Italiano", pt: "Português", uz: "Özbekça" };
+const NAMES = { en: "English", ru: "Русский", uk: "Українська", es: "Español", it: "Italiano", pt: "Português", uz: "Özbekça", fa: "فارسی" };
 
 let worker, recording = null, recAudio = [], fileMode = false, ready = false;
 let frozen = [], openW = [], tail = [];
