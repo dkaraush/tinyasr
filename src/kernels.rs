@@ -316,7 +316,26 @@ fn int8_dot() -> bool {
         }
         on == 2
     }
-    #[cfg(all(target_arch = "aarch64", not(feature = "std"), not(any(target_os = "linux", target_os = "android"))))]
+    #[cfg(all(target_arch = "aarch64", not(feature = "std"), target_os = "windows"))]
+    #[allow(unsafe_code)]
+    {
+        // the target enables only neon, so ask the OS (what is_aarch64_feature_detected! does on Windows); read once
+        use core::sync::atomic::{AtomicU8, Ordering};
+        unsafe extern "system" {
+            fn IsProcessorFeaturePresent(feature: u32) -> i32;
+        }
+        static ON: AtomicU8 = AtomicU8::new(0);
+        let mut on = ON.load(Ordering::Relaxed);
+        if on == 0 {
+            const PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE: u32 = 43;
+            // SAFETY: IsProcessorFeaturePresent only reads processor state.
+            let dp = cfg!(target_feature = "dotprod") || unsafe { IsProcessorFeaturePresent(PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE) } != 0;
+            on = if dp { 2 } else { 1 };
+            ON.store(on, Ordering::Relaxed);
+        }
+        on == 2
+    }
+    #[cfg(all(target_arch = "aarch64", not(feature = "std"), not(any(target_os = "linux", target_os = "android", target_os = "windows"))))]
     {
         cfg!(target_feature = "dotprod")
     }
