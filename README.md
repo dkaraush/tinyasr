@@ -14,7 +14,7 @@ Demo at: https://dkaraush.github.io/tinyasr/web/
 ### Building (Native)
 
 ```bash
-cargo build --release --features c-api
+cargo rustc --release --features c-api --lib --crate-type staticlib
 # library will be built at target/release/libtinyasr.a
 # include headers are at include/tinyasr.h
 ```

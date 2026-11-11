@@ -34,11 +34,11 @@ mod compat;
 mod fbank;
 mod kernels;
 mod model;
-#[cfg(feature = "c-api")]
+#[cfg(feature = "ffi")]
 mod ffi;
 mod file;
 // a static library without std carries its allocator (the host's malloc) and panic handler
-#[cfg(all(not(feature = "std"), not(target_arch = "wasm32"), not(test)))]
+#[cfg(all(not(feature = "std"), feature = "c-api", not(target_arch = "wasm32"), not(test)))]
 mod no_std_runtime;
 mod onnx;
 mod session;
