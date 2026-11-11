@@ -149,10 +149,9 @@ const loaded = {}, loading = {};
 
 function fillLangs() {
   const M = MODELS[+$("model").value], keep = $("lang").value;
-  $("lang").innerHTML = `<option value="">Language: auto (the model picks)</option>` +
-    M.langs.map(l => `<option value="${l}">${NAMES[l]}</option>`).join("");
+  $("lang").innerHTML = M.langs.map(l => `<option value="${l}">${NAMES[l]}</option>`).join("");
   const ui = (navigator.language || "en").slice(0, 2);
-  $("lang").value = M.langs.includes(keep) ? keep : M.langs.includes(ui) ? ui : "";
+  $("lang").value = M.langs.includes(keep) ? keep : M.langs.includes(ui) ? ui : M.langs[0];
 }
 
 async function boot() {
