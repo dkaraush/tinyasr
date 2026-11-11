@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [lib]
-crate-type = ["rlib", "staticlib"]
+# staticlib on demand (cargo rustc --crate-type staticlib, see README): a crate that lists it is built as one
+# even as a dependency, which then fails without the runtime that only c-api carries.
+crate-type = ["rlib"]
 
 [features]
 default = ["std"]
