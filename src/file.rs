@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use crate::model::Token;
 
 use crate::session::{CAP, FR, SR, compress, longest_pause};
-use crate::text::{W, balance_quotes, cap, is_end, show_quotes, spans, trim_trail, words};
+use crate::text::{W, balance_quotes, cap, is_end, show_quotes, spans, trim_trail, units, words};
 use crate::vad::{CHUNK, VadState};
 use crate::{Lang, Models, Word, allowed};
 
@@ -71,11 +71,12 @@ impl<'m> Transcription<'m> {
     /// The words out, timed by [`spans`] from the last word given out.
     fn out(&mut self, ws: &[W]) -> Vec<Word> {
         let vf = &self.vf;
-        let sp = spans(ws, self.last_end, |f| usize::try_from(f).ok().and_then(|i| vf.get(i).copied()));
+        let ws = if self.lang == Lang::Km { units(ws.to_vec()) } else { ws.to_vec() }; // Khmer: timed syllables
+        let sp = spans(&ws, self.last_end, |f| usize::try_from(f).ok().and_then(|i| vf.get(i).copied()));
         if let Some(&(_, e)) = sp.last() {
             self.last_end = e as f64;
         }
-        ws.iter().zip(sp).map(|(w, (start, end))| Word { text: show_quotes(w.w.clone(), self.lang), start, end }).collect()
+        ws.into_iter().zip(sp).map(|(w, (start, end))| Word { text: show_quotes(w.w, self.lang), start, end, join: w.join }).collect()
     }
 }
 

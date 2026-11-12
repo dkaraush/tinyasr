@@ -17,7 +17,7 @@ use crate::model::Token;
 
 #[cfg(not(feature = "std"))]
 use crate::compat::F64Ext;
-use crate::text::{W, balance_quotes, cap, is_end, norm, show_quotes, spans, trim_trail, words};
+use crate::text::{W, balance_quotes, cap, is_end, norm, show_quotes, spans, trim_trail, units, words};
 use crate::vad::{CHUNK, VadState};
 use crate::{Event, Lang, Models, Options, Word, allowed};
 
@@ -167,8 +167,13 @@ impl<'m> Session<'m> {
     /// Words out with the given texts, timed by [`spans`] from `from` (s).
     fn out(&self, ws: &[W], texts: impl Iterator<Item = String>, from: f64) -> Vec<Word> {
         let f0 = self.aud0 / FR;
-        let sp = spans(ws, from, |f| usize::try_from(f - f0).ok().and_then(|i| self.vf.get(i).copied()));
-        texts.zip(sp).map(|(text, (start, end))| Word { text: show_quotes(text, self.lang), start, end }).collect()
+        // the given texts (capitals) on the words; Khmer words cut into timed syllables
+        let mut ws: Vec<W> = ws.iter().zip(texts).map(|(w, text)| W { w: text, ..w.clone() }).collect();
+        if self.lang == Lang::Km {
+            ws = units(ws);
+        }
+        let sp = spans(&ws, from, |f| usize::try_from(f - f0).ok().and_then(|i| self.vf.get(i).copied()));
+        ws.into_iter().zip(sp).map(|(w, (start, end))| Word { text: show_quotes(w.w, self.lang), start, end, join: w.join }).collect()
     }
 
     fn stream_words(&self) -> Vec<W> {
@@ -248,7 +253,7 @@ impl<'m> Session<'m> {
             }
         }
         let mut key = String::new();
-        for w in open.iter().chain([Word { text: "\0".into(), start: 0.0, end: 0.0 }].iter()).chain(&tail) {
+        for w in open.iter().chain([Word { text: "\0".into(), start: 0.0, end: 0.0, join: false }].iter()).chain(&tail) {
             key.push_str(&w.text);
             key.push(' ');
         }

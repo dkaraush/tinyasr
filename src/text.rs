@@ -9,14 +9,17 @@ use crate::model::Token;
 
 /// A word with the times (s) of its first and last token; `tw`: of its last token with a letter or digit (the model
 /// often writes trailing punctuation only once it has heard the pause after it); `lp`: log-probability of the last
-/// token.
-#[derive(Clone, Debug)]
+/// token; `ts`: each token's byte offset in `w` and time (for units inside a word, [`units`]); `join`: no space before
+/// it (a unit inside a word).
+#[derive(Clone, Debug, Default)]
 pub struct W {
     pub w: String,
     pub t: f64,
     pub te: f64,
     pub tw: f64,
     pub lp: f32,
+    pub ts: Vec<(usize, f64)>,
+    pub join: bool,
 }
 
 /// The model's end-of-utterance token (v5.6): not text.
@@ -30,6 +33,7 @@ pub fn words(pieces: &[String], tk: &[Token], t0: f64) -> Vec<W> {
         let t = t0 + k.frame as f64 * 0.04;
         match out.last_mut() {
             Some(last) if !p.starts_with('▁') => {
+                last.ts.push((last.w.len(), t));
                 last.w.push_str(p);
                 last.te = t;
                 if p.chars().any(char::is_alphanumeric) {
@@ -37,10 +41,76 @@ pub fn words(pieces: &[String], tk: &[Token], t0: f64) -> Vec<W> {
                 }
                 last.lp = k.logp;
             }
-            _ => out.push(W { w: p.replace('▁', ""), t, te: t, tw: t, lp: k.logp }),
+            _ => out.push(W { w: p.replace('▁', ""), t, te: t, tw: t, lp: k.logp, ts: alloc::vec![(0, t)], join: false }),
         }
     }
     out.retain(|w| !w.w.is_empty());
+    out
+}
+
+/// Khmer writes no spaces inside a phrase, so a "word" can be a whole phrase: split each word with Khmer letters into
+/// syllables, each timed by the tokens it falls in. First clusters (a consonant or independent vowel with its coeng
+/// subscripts and signs; ៗ ។ and closing punctuation stay with the cluster before; a Latin or digit run is one unit),
+/// then, from the right, a bare consonant cluster (no vowel sign, no subscript) becomes the final consonant of the
+/// syllable before it when that one has none yet: ម|ក|ដ|ល់ -> មក|ដល់, ម្ម|ក|រ -> ម្ម|ករ. Units after the first of a
+/// word have `join` (no space before). Other words pass unchanged.
+pub fn units(ws: Vec<W>) -> Vec<W> {
+    let khmer = |c: char| ('\u{1780}'..='\u{17FF}').contains(&c);
+    let latin = |c: char| c.is_ascii_alphanumeric() || c.is_alphabetic() && !khmer(c);
+    let mut out = Vec::with_capacity(ws.len());
+    for w in ws {
+        if !w.w.chars().any(khmer) {
+            out.push(w);
+            continue;
+        }
+        let ch: Vec<(usize, char)> = w.w.char_indices().collect();
+        // clusters: [start, end) char ranges
+        let mut cl: Vec<(usize, usize)> = Vec::new();
+        let mut a = 0;
+        for i in 1..=ch.len() {
+            let new = i == ch.len() || {
+                let (c, p) = (ch[i].1, ch[i - 1].1);
+                p != '\u{17D2}'
+                    && match c {
+                        '\u{1780}'..='\u{17B3}' => true,
+                        c if latin(c) => !(latin(p) || matches!(p, '.' | ',' | ':' | '\'' | '-')),
+                        '«' | '(' | '"' | '“' => true,
+                        _ => false,
+                    }
+            };
+            if new {
+                cl.push((a, i));
+                a = i;
+            }
+        }
+        // a bare consonant: one consonant and only non-vowel signs (់ ៍ ...), no coeng, no vowel sign
+        let bare = |(x, y): (usize, usize)| {
+            ('\u{1780}'..='\u{17A2}').contains(&ch[x].1)
+                && ch[x + 1..y].iter().all(|&(_, c)| matches!(c, '\u{17C9}'..='\u{17D1}' | '\u{17D3}' | '\u{17DD}'))
+        };
+        let has = |(x, y): (usize, usize), c: char| ch[x..y].iter().any(|&(_, d)| d == c);
+        // a cluster with the bantoc ់ is itself a final: it takes none
+        let mut fin: Vec<bool> = cl.iter().map(|&r| has(r, '\u{17CB}')).collect();
+        let mut keep = vec![true; cl.len()];
+        for i in (1..cl.len()).rev() {
+            // before a subscript cluster, between two vowel-less consonants, a bare consonant starts its own syllable
+            // (រោង|ច|ក្រ); after a written vowel it is the final (ពឹង|ផ្អែក); with the bantoc ់ it is always a final
+            let before_sub = cl.get(i + 1).is_some_and(|&r| keep[i + 1] && has(r, '\u{17D2}'));
+            let own = before_sub && bare(cl[i - 1]) && !has(cl[i], '\u{17CB}');
+            if keep[i] && bare(cl[i]) && !own && !fin[i - 1] && khmer(ch[cl[i - 1].1 - 1].1) && !matches!(ch[cl[i - 1].1 - 1].1, '\u{17D4}'..='\u{17DC}') {
+                cl[i - 1].1 = cl[i].1; // the final consonant of the syllable before
+                fin[i - 1] = true;
+                keep[i] = false;
+            }
+        }
+        let time = |bt: usize| w.ts.iter().rev().find(|(o, _)| *o <= bt).map_or(w.t, |x| x.1);
+        for (k, &(x, y)) in cl.iter().enumerate().filter(|(i, _)| keep[*i]) {
+            let (b0, b1) = (ch[x].0, ch[y - 1].0);
+            let end = if y < ch.len() { ch[y].0 } else { w.w.len() };
+            let (t, te) = (time(b0), time(b1));
+            out.push(W { w: w.w[b0..end].into(), t, te, tw: te, lp: w.lp, ts: alloc::vec![(0, t)], join: k > 0 || w.join });
+        }
+    }
     out
 }
 
@@ -183,7 +253,7 @@ mod tests {
     use super::*;
 
     fn bq(s: &str) -> String {
-        let ws = s.split(' ').map(|w| W { w: w.into(), t: 0.0, te: 0.0, tw: 0.0, lp: 0.0 }).collect();
+        let ws = s.split(' ').map(|w| W { w: w.into(), ..W::default() }).collect();
         balance_quotes(ws).iter().map(|w| w.w.as_str()).collect::<Vec<_>>().join(" ")
     }
 

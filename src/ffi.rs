@@ -72,13 +72,15 @@ fn words(ws: &[Word], o: &mut String) {
         }
         o.push_str("{\"text\":");
         esc(&w.text, o);
-        o.push_str(&format!(",\"start\":{:.2},\"end\":{:.2}}}", w.start, w.end));
+        o.push_str(&format!(",\"start\":{:.2},\"end\":{:.2}", w.start, w.end));
+        o.push_str(if w.join { ",\"join\":true}" } else { "}" });
     }
     o.push(']');
 }
 
 /// Events as a JSON array: {"type": "commit", "words": [...]}, {"type": "partial", "open": [...], "tail": [...]},
-/// {"type": "language", "lang": "en"}, {"type": "eou", "at": s, "p": P}; a word is {"text", "start", "end"}.
+/// {"type": "language", "lang": "en"}, {"type": "eou", "at": s, "p": P}; a word is {"text", "start", "end"} plus "join": true when it is written without a
+/// space before it (Khmer syllables).
 pub fn events_json(ev: &[Event]) -> String {
     let mut o = String::from("[");
     for (i, e) in ev.iter().enumerate() {

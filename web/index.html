@@ -251,8 +251,12 @@ function getModel(i) {
   return p;
 }
 
-function spans(ws) {
-  return ws.map(w => fileMode ? `<span class="w click" data-t="${w.start.toFixed(2)}">${esc(w.text)}</span>` : esc(w.text)).join(" ");
+// words as HTML: a space before each unless it is joined to the one before (Khmer syllables); words of paragraph pi are
+// clickable (play from there) and highlighted during playback once that paragraph has its audio
+function spans(ws, pi) {
+  const click = pi !== undefined && paraSrc[pi];
+  return ws.map((w, i) => (i && !w.join ? " " : "") +
+    (click ? `<span class="w click" data-t="${w.start.toFixed(2)}" data-p="${pi}">${esc(w.text)}</span>` : esc(w.text))).join("");
 }
 let follow = true;
 $("out").addEventListener("scroll", () => { const o = $("out"); follow = o.scrollTop + o.clientHeight >= o.scrollHeight - 40; });
@@ -262,16 +266,21 @@ function show() {
   const out = $("out");
   if (!frozen.length && !openW.length && !tail.length) { out.innerHTML = '<span class="empty">Transcript appears here. Record, or drop an audio or video file on the page.</span>'; return; }
   if (!out.contains(frozenEl)) { out.innerHTML = ""; out.append(frozenEl, openEl, tailEl); }
-  openEl.innerHTML = (frozen.length && openW.length ? " " : "") + spans(openW);
-  tailEl.innerHTML = tail.length ? ((frozen.length || openW.length) ? " " : "") + spans(tail) : "";
+  openEl.innerHTML = (frozen.length && openW.length && !openW[0].join ? " " : "") + spans(openW);
+  tailEl.innerHTML = tail.length ? ((frozen.length || openW.length) && !tail[0].join ? " " : "") + spans(tail) : "";
   if (follow) out.scrollTop = out.scrollHeight;
 }
 function renderFrozen() {
   frozen = paras.flat();
-  frozenEl.innerHTML = paras.filter(p => p.length).map(spans).join("\n\n");
+  frozenEl.innerHTML = paras.map((p, i) => p.length ? spans(p, i) : null).filter(x => x !== null).join("\n\n");
 }
-function newPara() { if (paras[paras.length - 1].length) paras.push([]); }
-function clearText() { if (recording?.rec) recording.rec.cleared = true; paras = [[]]; openW = []; tail = []; renderFrozen(); show(); }
+let paraSrc = [null];  // each paragraph's audio (a recording's WAV, a file): clicking its words plays it
+function newPara() { if (paras[paras.length - 1].length) { paras.push([]); paraSrc.push(null); } }
+function clearText() {
+  if (recording?.rec) recording.rec.cleared = true;
+  paraSrc.forEach(u => u && u.startsWith("blob:") && u !== $("player").src && URL.revokeObjectURL(u));
+  paras = [[]]; paraSrc = [null]; openW = []; tail = []; renderFrozen(); show();
+}
 
 let rtfHint = "";
 function onWorker(ev) {
@@ -508,6 +517,13 @@ function stopMic() {
   $("mic").textContent = "● Record"; $("mic").classList.remove("on"); busy(false);
   status("Stopped.");
   $("save").hidden = !recAudio.length;
+  // the recording becomes playable: click a word to hear it from there, words light up as it plays
+  const pi = r.rec ? paras.indexOf(r.rec.para) : -1;
+  if (recAudio.length && pi >= 0) {
+    paraSrc[pi] = URL.createObjectURL(wav(recAudio));
+    const pl = $("player"); pl.src = paraSrc[pi]; pl.dataset.p = String(pi); pl.style.display = "block"; pl.style.height = "54px"; pl.style.background = "transparent";
+    renderFrozen(); show();
+  }
 }
 // The last recording as a 16 kHz mono 16-bit WAV: the exact audio the model heard.
 function wav(chunks) {
@@ -531,7 +547,8 @@ async function transcribeFile(f) {
   if (!ready) return;
   if (recording) stopMic();
   fileMode = true; clearText(); $("save").hidden = true;
-  const pl = $("player"); pl.src = URL.createObjectURL(f); pl.style.display = "block";
+  const pl = $("player"); pl.src = URL.createObjectURL(f); pl.style.display = "block"; pl.dataset.p = "0";
+  paraSrc[0] = pl.src;
   const video = f.type.startsWith("video");
   pl.style.height = video ? "" : "54px"; pl.style.background = video ? "#000" : "transparent";
   busy(true);
@@ -575,11 +592,15 @@ document.addEventListener("drop", ev => { ev.preventDefault(); ev.dataTransfer.f
 $("clear").onclick = clearText;
 $("out").addEventListener("click", ev => {
   const w = ev.target.closest(".w.click"); if (!w) return;
-  $("player").currentTime = +w.dataset.t; $("player").play();
+  const pl = $("player"), t = +w.dataset.t;
+  if (pl.dataset.p !== w.dataset.p) {  // another paragraph: its own audio
+    pl.src = paraSrc[+w.dataset.p]; pl.dataset.p = w.dataset.p; pl.style.display = "block";
+    pl.addEventListener("loadedmetadata", () => { pl.currentTime = t; pl.play(); }, { once: true });
+  } else { pl.currentTime = t; pl.play(); }
 });
 $("player").addEventListener("timeupdate", () => {
-  const t = $("player").currentTime; let cur = null;
-  document.querySelectorAll(".w.click").forEach(w => { w.classList.remove("now"); if (+w.dataset.t <= t) cur = w; });
+  const pl = $("player"), t = pl.currentTime; let cur = null;
+  document.querySelectorAll(".w.click").forEach(w => { w.classList.remove("now"); if (w.dataset.p === pl.dataset.p && +w.dataset.t <= t) cur = w; });
   if (cur) cur.classList.add("now");
 });
 

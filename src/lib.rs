@@ -92,12 +92,14 @@ fn allowed(m: &Models, langs: &[Lang]) -> Vec<Lang> {
     if l.is_empty() { own.to_vec() } else { l }
 }
 
-/// A recognized word: its text (with punctuation) and times (s from the start of the audio).
+/// A recognized word: its text (with punctuation) and times (s from the start of the audio). `join`: written without a
+/// space before it (Khmer: a word is cut into syllables, each with its own times).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Word {
     pub text: String,
     pub start: f32,
     pub end: f32,
+    pub join: bool,
 }
 
 /// What recognition reports, in order.
