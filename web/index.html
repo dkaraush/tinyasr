@@ -27,6 +27,7 @@ button.on { background: var(--live); border-color: var(--live); color: #fff; }
 button:disabled, select:disabled { opacity: .5; cursor: default; }
 label.file input { display: none; }
 #status { color: var(--muted); font-size: 13px; min-height: 20px; margin: 8px 0; }
+#lid { color: var(--muted); font-size: 12px; margin: -4px 0 8px; font-variant-numeric: tabular-nums; }
 #player { width: 100%; margin: 8px 0; display: none; max-height: 360px; border-radius: 8px; }
 #dl { position: sticky; top: 0; z-index: 5; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; margin: 8px 0; font-size: 14px; }
 #out { unicode-bidi: plaintext; text-align: start; /* Persian lines right-to-left, each line by its own text */ background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; min-height: 200px;
@@ -53,6 +54,7 @@ progress { width: 160px; height: 8px; vertical-align: middle; }
   </div>
   <div id="dl" hidden></div>
   <div id="status">Loading…</div>
+  <div id="lid" hidden></div>
   <video id="player" controls></video>
   <div id="out"><span class="empty">Transcript appears here. Record, or drop an audio or video file on the page.</span></div>
 </main>
@@ -107,6 +109,17 @@ onmessage = ev => {
       const l = cstr(m.langs), s0 = m.start ? cstr(m.start) : null;
       S = x.tinyasr_session_new(M, l[0], s0 ? s0[0] : 0, x.tinyasr_clock());
       free(l); if (s0) free(s0);
+    } else if (m.type === "replay") {
+      // auto-detect switched the language: the old session is dropped (no events), a new one hears the recording so far
+      if (S) { x.tinyasr_session_free(S); S = 0; }
+      M = models[m.file];
+      const l = cstr(m.langs), s0 = cstr(m.langs.split(",")[0]);  // start in the first language (the library orders by the model)
+      S = x.tinyasr_session_new(M, l[0], s0[0], x.tinyasr_clock());
+      free(l); free(s0);
+      const ev = [];
+      for (const c of m.chunks) ev.push(...JSON.parse(str(withPcm(c, p => x.tinyasr_session_push(S, p, c.length)))));
+      postMessage({ type: "events", reset: true, ev });
+      if (m.finish) stop();
     } else if (m.type === "audio") {
       if (S) postMessage({ type: "events", ev: JSON.parse(str(withPcm(m.x, p => x.tinyasr_session_push(S, p, m.x.length)))) });
     } else if (m.type === "stop") {
@@ -128,6 +141,32 @@ onmessage = ev => {
 };
 </script>
 
+<script id="lid-src" type="text/plain">
+// tinylid (spoken language ID, WebAssembly): {type:"init", wasm, model} -> {type:"ready", langs};
+// {type:"predict", id, x} -> {type:"probs", id, probs} (16 kHz mono, the clip's real length)
+let ex, h, n;
+onmessage = ev => {
+  const m = ev.data;
+  if (m.type === "init") {
+    ex = new WebAssembly.Instance(new WebAssembly.Module(m.wasm), {}).exports;
+    const b = new Uint8Array(m.model), p = ex.tinylid_alloc(b.length);
+    new Uint8Array(ex.memory.buffer, p, b.length).set(b);
+    h = ex.tinylid_load(p, b.length); ex.tinylid_dealloc(p, b.length);
+    n = ex.tinylid_num_languages(h);
+    const langs = [];
+    for (let i = 0; i < n; i++) { const s = new Uint8Array(ex.memory.buffer, ex.tinylid_language(h, i), 16); langs.push(new TextDecoder().decode(s.subarray(0, s.indexOf(0)))); }
+    postMessage({ type: "ready", langs });
+  } else if (m.type === "predict") {
+    const a = ex.tinylid_alloc(m.x.length * 4), o = ex.tinylid_alloc(n * 4);
+    new Float32Array(ex.memory.buffer, a, m.x.length).set(m.x);
+    const rc = ex.tinylid_predict(h, a, m.x.length, 16000, 0, o);
+    const probs = new Float32Array(ex.memory.buffer, o, n).slice();
+    ex.tinylid_dealloc(a, m.x.length * 4); ex.tinylid_dealloc(o, n * 4);
+    postMessage({ type: "probs", id: m.id, probs: rc === 0 ? probs : null });
+  }
+};
+</script>
+
 <script>
 const $ = id => document.getElementById(id);
 const status = s => $("status").innerHTML = s;
@@ -143,12 +182,32 @@ const MODELS = [
   { file: "en-km.tzf", name: "English, Khmer", langs: ["en", "km"], mb: 34.6 },
 ];
 const NAMES = { en: "English", ru: "Русский", uk: "Українська", es: "Español", it: "Italiano", pt: "Português", uz: "Özbekça", fa: "فارسی", km: "ខ្មែរ" };
+// Auto-detect: the model each language is recognized with (en, ru: the en-ru-uk model)
+const MODEL_OF = { en: 0, ru: 0, uk: 0, es: 1, it: 1, pt: 1, uz: 2, fa: 3, km: 4 };
+// tinylid runs once the speech heard so far (pauses not counted) is this long; its top language counts when this sure.
+// Later checks hear more and can still correct an earlier verdict (a short window is often unsure or wrong).
+const LID_AT = [[1, 0.85], [2, 0.75], [5, 0.6], [10, 0.6], [20, 0.6]];
+const langName = l => NAMES[l] || (() => { try { return new Intl.DisplayNames(["en"], { type: "language" }).of(l); } catch { return l; } })();
+const auto = () => $("model").value === "auto";
+// every recognition in a language other than English also considers English (all models have it): an English
+// sentence comes out in English even before tinylid notices; the first language stays the session's start
+const withEn = L => L.split(",").includes("en") ? L : L + ",en";
+// the last language tinylid was sure of: where the next recording starts (this browser only)
+function lastLang() {
+  let l = null;
+  try { l = localStorage.getItem("tinyasr.lang"); } catch {}
+  const ui = (navigator.language || "en").slice(0, 2);
+  return l in MODEL_OF ? l : ui in MODEL_OF ? ui : "en";
+}
+function saveLang(l) { try { localStorage.setItem("tinyasr.lang", l); } catch {} }
 
 let worker, recording = null, recAudio = [], fileMode = false, ready = false;
-let frozen = [], openW = [], tail = [];
+let paras = [[]], frozen = [], openW = [], tail = [];  // frozen words, per recording (paragraph)
 const loaded = {}, loading = {};
 
 function fillLangs() {
+  $("lang").hidden = auto();
+  if (auto()) return;
   const M = MODELS[+$("model").value], keep = $("lang").value;
   $("lang").innerHTML = M.langs.map(l => `<option value="${l}">${NAMES[l]}</option>`).join("");
   const ui = (navigator.language || "en").slice(0, 2);
@@ -156,10 +215,11 @@ function fillLangs() {
 }
 
 async function boot() {
+  $("model").insertAdjacentHTML("beforeend", `<option value="auto">Auto-detect language</option>`);
   for (const [i, M] of MODELS.entries()) $("model").insertAdjacentHTML("beforeend", `<option value="${i}">${esc(M.name)}</option>`);
-  const ui = (navigator.language || "en").slice(0, 2);
-  $("model").value = Math.max(0, MODELS.findIndex(M => M.langs.includes(ui) && ui !== "en"));
+  $("model").value = "auto";
   fillLangs();
+  lidBoot().catch(err => console.warn("tinylid:", err));
   const [wasm, vad] = await Promise.all(["tinyasr.wasm", BASE + "silero_vad.onnx"].map(async u => {
     const r = await fetch(u); if (!r.ok) throw new Error(`${u}: ${r.status}`); return r.arrayBuffer();
   }));
@@ -206,7 +266,12 @@ function show() {
   tailEl.innerHTML = tail.length ? ((frozen.length || openW.length) ? " " : "") + spans(tail) : "";
   if (follow) out.scrollTop = out.scrollHeight;
 }
-function clearText() { frozen = []; openW = []; tail = []; frozenEl.innerHTML = ""; show(); }
+function renderFrozen() {
+  frozen = paras.flat();
+  frozenEl.innerHTML = paras.filter(p => p.length).map(spans).join("\n\n");
+}
+function newPara() { if (paras[paras.length - 1].length) paras.push([]); }
+function clearText() { if (recording?.rec) recording.rec.cleared = true; paras = [[]]; openW = []; tail = []; renderFrozen(); show(); }
 
 let rtfHint = "";
 function onWorker(ev) {
@@ -219,10 +284,10 @@ function onWorker(ev) {
   } else if (m.type === "error") {
     status("Error: " + esc(m.text));
   } else if (m.type === "events") {
+    if (m.reset) { paras[paras.length - 1].length = 0; openW = []; tail = []; renderFrozen(); }  // in place: rec.para stays this array
     for (const e of m.ev) {
       if (e.type === "commit") {
-        frozenEl.insertAdjacentHTML("beforeend", (frozen.length ? " " : "") + spans(e.words));
-        frozen.push(...e.words); openW = []; tail = [];
+        paras[paras.length - 1].push(...e.words); renderFrozen(); openW = []; tail = [];
       } else if (e.type === "partial") { openW = e.open; tail = e.tail; }
       else if (e.type === "language" && recording) status(`Listening… language: ${NAMES[e.lang] || e.lang}`);
     }
@@ -235,35 +300,210 @@ function onWorker(ev) {
   }
 }
 function busy(b) { ["mic", "model", "lang", "file"].forEach(id => $(id).disabled = b); }
-function langs() { const M = MODELS[+$("model").value]; return $("lang").value || M.langs.join(","); }
+function langs() { if (auto()) return lastLang(); const M = MODELS[+$("model").value]; return $("lang").value || M.langs.join(","); }
+
+// ---- language auto-detect (tinylid) ----
+let lid = null, lidLangs = null, lidSeq = 0;
+const lidWait = {};
+async function lidBoot() {
+  const [wasm, model] = await Promise.all(["tinylid.wasm", BASE + "tinylid.bin"].map(async u => {
+    const r = await fetch(u); if (!r.ok) throw new Error(`${u}: ${r.status}`); return r.arrayBuffer();
+  }));
+  lid = new Worker(URL.createObjectURL(new Blob([$("lid-src").textContent], { type: "text/javascript" })));
+  lid.onmessage = ev => {
+    const m = ev.data;
+    if (m.type === "ready") lidLangs = m.langs;
+    else if (m.type === "probs") { lidWait[m.id]?.(m.probs); delete lidWait[m.id]; }
+  };
+  lid.postMessage({ type: "init", wasm, model }, [wasm, model]);
+}
+// top language and its probability for 16 kHz audio, or null
+function detect(x) {
+  if (!lid || !lidLangs) return Promise.resolve(null);
+  const id = ++lidSeq;
+  return new Promise(res => {
+    lidWait[id] = probs => {
+      if (!probs) return res(null);
+      const top = [...probs].map((p, i) => ({ lang: lidLangs[i], p })).sort((a, b) => b.p - a.p).slice(0, 5);
+      res({ lang: top[0].lang, p: top[0].p, top });
+    };
+    lid.postMessage({ type: "predict", id, x }, [x.buffer]);
+  });
+}
+// Only the speech, as in the tinylid demo: 30 ms frames louder than the mic's own noise floor (+12 dB, at least
+// -55 dBFS), plus 200 ms around them. Pauses and room noise never reach tinylid.
+function speechOnly(a) {
+  const hop = 480, nf = Math.floor(a.length / hop);
+  if (!nf) return a.subarray(0, 0);
+  const db = new Float32Array(nf);
+  for (let f = 0; f < nf; f++) {
+    let e = 0;
+    for (let i = f * hop; i < (f + 1) * hop; i++) e += a[i] * a[i];
+    db[f] = 10 * Math.log10(e / hop + 1e-12);
+  }
+  const floor = [...db].sort((x, y) => x - y)[Math.floor(nf * 0.1)];
+  const thr = Math.max(floor + 12, -55), pad = Math.round(0.2 / 0.03);
+  const keep = new Uint8Array(nf);
+  for (let f = 0; f < nf; f++) if (db[f] > thr) for (let g = Math.max(0, f - pad); g <= Math.min(nf - 1, f + pad); g++) keep[g] = 1;
+  const out = new Float32Array(keep.reduce((s, k) => s + k, 0) * hop);
+  let o = 0;
+  for (let f = 0; f < nf; f++) if (keep[f]) { out.set(a.subarray(f * hop, (f + 1) * hop), o); o += hop; }
+  return out;
+}
+// tinylid on the first `sec` s of speech of x: {lang, p} when it is that sure (not "other"), null when it is not sure,
+// undefined when there is not that much speech yet
+async function verdict(x, sec, minP) {
+  const sp = speechOnly(x);
+  if (sp.length < sec * 16000) return undefined;
+  const r = await detect(sp.slice(0, sec * 16000));
+  if (r) showLid(r, sec, minP);
+  if (r) r.sure = r.p >= minP && r.lang !== "other";
+  return r;
+}
+// when tinylid is not sure: the supported languages it gives >= 10%, in the model holding most of their probability,
+// plus the current language if that model has it. tinyasr then decodes in each and keeps the transcript it is surest of.
+function candidates(r, cur) {
+  const sup = r.top.filter(t => t.lang in MODEL_OF && t.p >= 0.1);
+  if (!sup.length) return null;
+  const mass = {};
+  for (const t of sup) mass[MODEL_OF[t.lang]] = (mass[MODEL_OF[t.lang]] || 0) + t.p;
+  const mi = +Object.keys(mass).sort((a, b) => mass[b] - mass[a])[0];
+  const langs = sup.filter(t => MODEL_OF[t.lang] === mi).map(t => t.lang);
+  if (cur && MODELS[mi].langs.includes(cur) && !langs.includes(cur)) langs.push(cur);
+  return { mi, langs };
+}
+// tinylid's last answer: its top 5 languages, the speech it heard, and whether that counted
+function showLid(r, sec, minP) {
+  const el = $("lid"); el.hidden = false;
+  el.textContent = `tinylid, ${sec.toFixed(1)} s of speech: ` + r.top.map(t => `${t.lang} ${Math.round(100 * t.p)}%`).join(" · ")
+    + (r.p >= minP && r.lang !== "other" ? "" : `  (not sure: needs ${Math.round(100 * minP)}%)`);
+}
+
 
 $("model").onchange = fillLangs;
 $("mic").onclick = async () => {
   if (recording) { stopMic(); return; }
   fileMode = false; $("player").style.display = "none"; $("save").hidden = true;
-  const mi = +$("model").value;
+  const startLang = auto() ? lastLang() : null;
+  const mi = auto() ? MODEL_OF[startLang] : +$("model").value;
   busy(true);
   try {
     if (!loaded[MODELS[mi].file]) status("Downloading the model…");
     await getModel(mi);
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
-    const ctx = new AudioContext({ sampleRate: 16000 });
-    const proc = `class P extends AudioWorkletProcessor{constructor(){super();this.b=[];this.n=0}process(i){const c=i[0][0];if(c){this.b.push(c.slice());this.n+=c.length;if(this.n>=640){const o=new Float32Array(this.n);let k=0;for(const x of this.b){o.set(x,k);k+=x.length}this.port.postMessage(o,[o.buffer]);this.b=[];this.n=0}}return true}}registerProcessor("p",P)`;
-    await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([proc], { type: "text/javascript" })));
-    const src = ctx.createMediaStreamSource(stream), node = new AudioWorkletNode(ctx, "p");
     recAudio = [];
-    node.port.onmessage = ev => { recAudio.push(ev.data.slice()); worker.postMessage({ type: "audio", x: ev.data }, [ev.data.buffer]); };
-    src.connect(node);
-    if (frozen.length || openW.length) frozenEl.insertAdjacentHTML("beforeend", "\n\n");  // a new recording, a new paragraph
-    worker.postMessage({ type: "start", file: MODELS[mi].file, langs: langs(), start: $("lang").value || (navigator.language || "en").slice(0, 2) });
-    recording = { stream, ctx };
+    newPara();  // a new recording, a new paragraph
+    const rec = { lang: startLang, file: MODELS[mi].file, step: 0, busy: false, done: false, para: paras[paras.length - 1] };
+    let peak = 0, heard = 0, raw = true;
+    const onChunk = x => {
+      for (const v of x) peak = Math.max(peak, Math.abs(v));
+      heard += x.length;
+      // 2 s of (near) zeros from the raw microphone: some setups only deliver sound with the browser's own processing
+      // (gain control etc.); reopen it that way and keep recording. Still zeros: say which input it is.
+      if (heard >= 2 * 16000 && peak < 0.001 && recording?.rec === rec) {
+        if (raw) {
+          raw = false; heard = 0;
+          closeMic(recording);
+          openMic(false, onChunk).then(m => { if (recording?.rec === rec) Object.assign(recording, m); else closeMic(m); })
+            .catch(err => status("Microphone: " + esc(err.message)));
+        } else if (heard < 2 * 16000 + x.length) {
+          const t = recording.stream.getAudioTracks()[0], st = t?.getSettings?.() || {};
+          status(`No sound from the microphone "${esc(t?.label || "default")}" (${st.sampleRate || recording.ctx.sampleRate} Hz, peak ${peak ? (20 * Math.log10(peak)).toFixed(0) + " dBFS" : "exactly 0"}): it may be muted, or not the input you speak into.`);
+        }
+      }
+      recAudio.push(x.slice()); worker.postMessage({ type: "audio", x }, [x.buffer]);
+      if (auto()) autoStep(rec);
+    };
+    const { stream, ctx } = await openMic(true, onChunk);
+    worker.postMessage({ type: "start", file: MODELS[mi].file, langs: withEn(auto() ? startLang : langs()), start: auto() ? startLang : $("lang").value || (navigator.language || "en").slice(0, 2) });
+    recording = { stream, ctx, rec };
     $("mic").disabled = false; $("mic").textContent = "■ Stop"; $("mic").classList.add("on");
-    status("Listening…");
+    status(auto() ? `Listening… (${esc(langName(startLang))}, detecting the language)` : "Listening…");
   } catch (err) { busy(false); status("Microphone: " + esc(err.message)); }
 };
+// one detection at a time, at 1, 2 and 5 s of speech (pauses do not count); a sure answer that is not the current language switches
+// (the model downloads if needed; the recording so far is replayed into it)
+function autoStep(rec) {
+  if (rec.busy || rec.done || rec.step >= LID_AT.length) return;
+  const [sec, minP] = LID_AT[rec.step], n = recAudio.reduce((a, c) => a + c.length, 0);
+  if (n < sec * 16000) return;
+  rec.busy = true;
+  const x = new Float32Array(n); let k = 0; for (const c of recAudio) { x.set(c, k); k += c.length; }
+  verdict(x, sec, minP).then(r => {
+    rec.busy = false;
+    if (r !== undefined) rec.step++;  // that much speech heard: the next check waits for more
+    if (!r) return;
+    if (!r.sure) return;  // not sure: keep going (a session in several languages costs that many decodes: only at Stop)
+    if (!(r.lang in MODEL_OF)) {
+      if (recording?.rec === rec) status(`Listening… this sounds like ${esc(langName(r.lang))} (${Math.round(100 * r.p)}%), which no model recognizes yet; staying with ${esc(langName(rec.lang))}`);
+      return;
+    }
+    if (r.lang === rec.lang && !rec.langs) {
+      rec.confirmed = true; saveLang(r.lang);
+      if (recording?.rec === rec) status(`Listening… ${esc(langName(r.lang))} (detected, ${Math.round(100 * r.p)}%)`);
+      return;
+    }
+    if (rec.confirmed && r.p < 0.8) return;  // a confirmed language moves only on a clearly surer answer (no ru/uk flip-flop)
+    saveLang(r.lang); rec.confirmed = true;
+    switchTo(rec, r);
+  });
+}
+// at Stop: tinylid on all the speech of the recording (>= 0.5 s, <= 30 s), unless a check already confirmed the language
+async function finalCheck(rec) {
+  if (rec.confirmed || !recAudio.length) return;
+  const n = recAudio.reduce((a, c) => a + c.length, 0), x = new Float32Array(n);
+  let k = 0; for (const c of recAudio) { x.set(c, k); k += c.length; }
+  const sec = speechOnly(x).length / 16000;
+  if (sec < 0.5 || sec > 30) return;  // long recordings: the checks while recording decided (or the language stays)
+  const r = await verdict(x, sec, 0.6);
+  if (!r) return;
+  if (r.sure) {
+    if (!(r.lang in MODEL_OF)) return;
+    saveLang(r.lang);
+    if (r.lang !== rec.lang) switchTo(rec, r);
+    return;
+  }
+  // not sure (a short phrase): let tinyasr choose among tinylid's candidates
+  const c = candidates(r, rec.lang);
+  if (!c || (c.langs.length === 1 && c.langs[0] === rec.lang) || c.langs.join(",") === rec.langs) return;
+  switchTo(rec, r, c);
+}
+async function switchTo(rec, r, c) {
+  const mi = c ? c.mi : MODEL_OF[r.lang], L = c ? c.langs.join(",") : r.lang;
+  if (recording?.rec === rec) status(`Listening… switching to ${esc(langName(r.lang))} (${Math.round(100 * r.p)}%)${loaded[MODELS[mi].file] ? "" : ", downloading its model"}`);
+  await getModel(mi);
+  if ((recording && recording.rec !== rec) || fileMode || rec.cleared || (rec.done && paras[paras.length - 1] !== rec.para)) return;  // something newer started meanwhile
+  rec.lang = c ? null : r.lang; rec.langs = c ? L : null; rec.file = MODELS[mi].file;
+  const live = recording?.rec === rec;
+  worker.postMessage({ type: "replay", file: rec.file, langs: withEn(L), chunks: recAudio.map(c => c.slice()), finish: !live });
+  const what = c ? `${c.langs.map(langName).map(esc).join(" / ")} (tinylid not sure; the recognizer picks)` : `${esc(langName(r.lang))} (detected, ${Math.round(100 * r.p)}%)`;
+  status(live ? `Listening… ${what}` : `Done: ${what}`);
+}
+// The microphone at the device's own rate (a 16 kHz AudioContext on a 48 kHz input gives silence on some setups),
+// resampled to 16 kHz in the worklet (linear interpolation over a 3-tap average), 40 ms pieces to onChunk.
+// raw: without the browser's echo cancellation / noise suppression / gain control (the model was trained on raw audio).
+async function openMic(raw, onChunk) {
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: raw ? { echoCancellation: false, noiseSuppression: false, autoGainControl: false } : true });
+  const ctx = new AudioContext();
+  const proc = `class P extends AudioWorkletProcessor{constructor(){super();this.r=sampleRate/16000;this.t=0;this.p=0;this.q=0;this.o=[]}
+process(i){const c=i[0][0];if(!c)return true;const r=this.r,n=c.length,x=new Float32Array(n);
+for(let j=0;j<n;j++){const a=j>0?c[j-1]:this.p,b=c[j],d=j+1<n?c[j+1]:c[j];x[j]=r>=2?(a+b+d)/3:b}
+let t=this.t;while(t<n-1){const k=Math.floor(t),f=t-k,a=k<0?this.q:x[k];this.o.push(a+(x[k+1]-a)*f);t+=r}
+this.t=t-n;this.p=c[n-1];this.q=x[n-1];
+if(this.o.length>=640){const o=Float32Array.from(this.o);this.o=[];this.port.postMessage(o,[o.buffer])}return true}}
+registerProcessor("p",P)`;
+  await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([proc], { type: "text/javascript" })));
+  const src = ctx.createMediaStreamSource(stream), node = new AudioWorkletNode(ctx, "p");
+  node.port.onmessage = ev => onChunk(ev.data);
+  src.connect(node);
+  if (ctx.state === "suspended") await ctx.resume();
+  return { stream, ctx };
+}
+function closeMic(m) { m.stream.getTracks().forEach(t => t.stop()); m.ctx.close(); }
 function stopMic() {
   const r = recording; recording = null;
-  r.stream.getTracks().forEach(t => t.stop()); r.ctx.close();
+  if (r.rec) r.rec.done = true;
+  closeMic(r);
+  if (auto() && r.rec && !r.rec.cleared) finalCheck(r.rec);
   worker.postMessage({ type: "stop" });
   $("mic").textContent = "● Record"; $("mic").classList.remove("on"); busy(false);
   status("Stopped.");
@@ -302,9 +542,31 @@ async function transcribeFile(f) {
     const off = new OfflineAudioContext(1, Math.ceil(dec.duration * 16000), 16000);
     const s = off.createBufferSource(); s.buffer = dec; s.connect(off.destination); s.start();
     const x = (await off.startRendering()).getChannelData(0).slice();
-    await getModel(mi);
+    let L = auto() ? null : langs(), file = MODELS[mi]?.file;
+    if (auto()) {
+      // all the speech tinylid can take (<= 30 s; the more it hears, the surer it is), else the shorter windows; else the
+      // remembered language
+      let r = null;
+      const sp = speechOnly(x).length / 16000;
+      let first = null;
+      for (const [sec, minP] of [[Math.min(30, sp), 0.6], ...[...LID_AT].reverse()]) {
+        if (sec < 0.5) continue;
+        r = await verdict(x, sec, minP);
+        first = first || r;
+        if (r?.sure) break;
+      }
+      let mi2;
+      if (r?.sure && r.lang in MODEL_OF) { L = r.lang; mi2 = MODEL_OF[L]; saveLang(L); status(`Detected ${esc(langName(L))} (${Math.round(100 * r.p)}%)…`); }
+      else {
+        const c = first && !first.sure ? candidates(first, lastLang()) : null;
+        if (c) { L = c.langs.join(","); mi2 = c.mi; status(`Language not clear; the recognizer picks among ${c.langs.map(langName).map(esc).join(" / ")}…`); }
+        else { L = lastLang(); mi2 = MODEL_OF[L]; status(r?.sure ? `This sounds like ${esc(langName(r.lang))}, which no model recognizes yet; using ${esc(langName(L))}…` : `Language not clear; using ${esc(langName(L))}…`); }
+      }
+      file = MODELS[mi2].file;
+      await getModel(mi2);
+    } else await getModel(mi);
     status("Transcribing…");
-    worker.postMessage({ type: "file", file: MODELS[mi].file, x, langs: langs() }, [x.buffer]);
+    worker.postMessage({ type: "file", file, x, langs: withEn(L) }, [x.buffer]);
   } catch (err) { busy(false); status("Could not decode the file: " + esc(err.message)); }
 }
 $("file").onchange = () => $("file").files[0] && transcribeFile($("file").files[0]);
