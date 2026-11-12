@@ -28,6 +28,7 @@
 #![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
 #![deny(unsafe_code)]
 
+#[macro_use] // vec! in every module, also without std
 extern crate alloc;
 
 mod compat;
