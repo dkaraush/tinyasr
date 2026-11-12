@@ -17,7 +17,7 @@ use crate::model::Token;
 
 #[cfg(not(feature = "std"))]
 use crate::compat::F64Ext;
-use crate::text::{W, balance_quotes, cap, is_end, norm, show_quotes, spans, trim_trail, units, words};
+use crate::text::{W, balance_quotes, cap, end_mark, is_end, norm, show_quotes, spans, trim_trail, units, words};
 use crate::vad::{CHUNK, VadState};
 use crate::{Event, Lang, Models, Options, Word, allowed};
 
@@ -376,7 +376,7 @@ impl<'m> Session<'m> {
         self.turn0 = self.pos;
         let Some(last) = self.open.last_mut() else { return };
         if !is_end(&last.w) {
-            last.w = format!("{}.", trim_trail(&last.w));
+            last.w = format!("{}{}", trim_trail(&last.w), end_mark(self.lang));
         }
         self.freeze(self.open.len(), self.pos - FR, 0);
     }

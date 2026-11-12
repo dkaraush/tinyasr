@@ -163,10 +163,15 @@ fn lag() -> f64 {
 /// How late the transducer writes a word after its sound (s): measured on FLEURS against the speech's own starts and ends.
 const LAG: f64 = 0.32;
 
-/// Ends a sentence: . ? ! … (Khmer ។) optionally followed by a closing quote.
+/// Ends a sentence: . ? ! … (Khmer ។, Persian ؟) optionally followed by a closing quote.
 pub fn is_end(w: &str) -> bool {
     let w = w.strip_suffix(['"', '»']).unwrap_or(w);
-    w.ends_with(['.', '?', '!', '…', '។'])
+    w.ends_with(['.', '?', '!', '…', '។', '؟'])
+}
+
+/// The full stop a sentence gets when the model wrote none: Khmer ។, else "."
+pub fn end_mark(lang: crate::Lang) -> char {
+    if lang == crate::Lang::Km { '។' } else { '.' }
 }
 
 /// The quote marks as the language writes them: the model writes « » (two shared tokens); Khmer readers expect “ ”
@@ -175,9 +180,9 @@ pub fn show_quotes(w: String, lang: crate::Lang) -> String {
     if lang == crate::Lang::Km && w.contains(['«', '»']) { w.replace('«', "“").replace('»', "”") } else { w }
 }
 
-/// Without trailing , ; : — – -
+/// Without trailing , ; : — – - (Persian ، ؛)
 pub fn trim_trail(w: &str) -> &str {
-    w.trim_end_matches([',', ';', ':', '—', '–', '-'])
+    w.trim_end_matches([',', ';', ':', '—', '–', '-', '،', '؛'])
 }
 
 /// The first letter in upper case (not after a digit: "20th").

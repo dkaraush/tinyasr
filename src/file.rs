@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use crate::model::Token;
 
 use crate::session::{CAP, FR, SR, compress, longest_pause};
-use crate::text::{W, balance_quotes, cap, is_end, show_quotes, spans, trim_trail, units, words};
+use crate::text::{W, balance_quotes, cap, end_mark, is_end, show_quotes, spans, trim_trail, units, words};
 use crate::vad::{CHUNK, VadState};
 use crate::{Lang, Models, Word, allowed};
 
@@ -120,7 +120,7 @@ impl Iterator for Transcription<'_> {
                 if end {
                     if let Some(last) = ws.last_mut() {
                         if !is_end(&last.w) {
-                            last.w = format!("{}.", trim_trail(&last.w));
+                            last.w = format!("{}{}", trim_trail(&last.w), end_mark(self.lang));
                         }
                     }
                 }
