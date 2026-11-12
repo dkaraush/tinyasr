@@ -67,13 +67,14 @@ pub enum Lang {
     Pt = 5,
     Uz = 6,
     Fa = 7,
+    Km = 8,
 }
 
 impl Lang {
-    pub const ALL: [Lang; 8] = [Lang::En, Lang::Ru, Lang::Uk, Lang::Es, Lang::It, Lang::Pt, Lang::Uz, Lang::Fa];
+    pub const ALL: [Lang; 9] = [Lang::En, Lang::Ru, Lang::Uk, Lang::Es, Lang::It, Lang::Pt, Lang::Uz, Lang::Fa, Lang::Km];
 
     pub fn code(self) -> &'static str {
-        ["en", "ru", "uk", "es", "it", "pt", "uz", "fa"][self as usize]
+        ["en", "ru", "uk", "es", "it", "pt", "uz", "fa", "km"][self as usize]
     }
 
     pub fn from_code(c: &str) -> Option<Lang> {

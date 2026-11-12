@@ -17,7 +17,7 @@ use crate::model::Token;
 
 #[cfg(not(feature = "std"))]
 use crate::compat::F64Ext;
-use crate::text::{W, balance_quotes, cap, is_end, norm, spans, trim_trail, words};
+use crate::text::{W, balance_quotes, cap, is_end, norm, show_quotes, spans, trim_trail, words};
 use crate::vad::{CHUNK, VadState};
 use crate::{Event, Lang, Models, Options, Word, allowed};
 
@@ -168,7 +168,7 @@ impl<'m> Session<'m> {
     fn out(&self, ws: &[W], texts: impl Iterator<Item = String>, from: f64) -> Vec<Word> {
         let f0 = self.aud0 / FR;
         let sp = spans(ws, from, |f| usize::try_from(f - f0).ok().and_then(|i| self.vf.get(i).copied()));
-        texts.zip(sp).map(|(text, (start, end))| Word { text, start, end }).collect()
+        texts.zip(sp).map(|(text, (start, end))| Word { text: show_quotes(text, self.lang), start, end }).collect()
     }
 
     fn stream_words(&self) -> Vec<W> {

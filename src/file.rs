@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use crate::model::Token;
 
 use crate::session::{CAP, FR, SR, compress, longest_pause};
-use crate::text::{W, balance_quotes, cap, is_end, spans, trim_trail, words};
+use crate::text::{W, balance_quotes, cap, is_end, show_quotes, spans, trim_trail, words};
 use crate::vad::{CHUNK, VadState};
 use crate::{Lang, Models, Word, allowed};
 
@@ -75,7 +75,7 @@ impl<'m> Transcription<'m> {
         if let Some(&(_, e)) = sp.last() {
             self.last_end = e as f64;
         }
-        ws.iter().zip(sp).map(|(w, (start, end))| Word { text: w.w.clone(), start, end }).collect()
+        ws.iter().zip(sp).map(|(w, (start, end))| Word { text: show_quotes(w.w.clone(), self.lang), start, end }).collect()
     }
 }
 
