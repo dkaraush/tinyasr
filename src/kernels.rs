@@ -285,8 +285,13 @@ pub fn tanh(x: f32) -> f32 {
 // - scales: per panel, per group, 8 f32 (one per output).
 //
 // Activations are quantized per call to int8 per row and per group (`pack_act`), interleaved the same way in pairs of
-// rows, so one 16-byte load is [row 2r: k..k+8 | row 2r+1: k..k+8]. A kernel call computes 2 x 2 output blocks for 1 or
-// 2 row pairs x the 4 output pairs of a panel; int32 sums are scaled into f32 at every group end.
+// rows, so one 16-byte load is [row 2r: k..k+8 | row 2r+1: k..k+8]. A kernel call computes 2 x 2 output blocks for 1 to
+// 4 row pairs x the 4 output pairs of a panel; int32 sums are scaled into f32 at every group end.
+//
+// The `sdot` path (dotprod without i8mm) has its own panel layout instead (`lay4`, chosen at load): for every 4 k, two
+// 16-byte vectors of 4 outputs x those 4 k ([o0: k..k+4 | o1 | o2 | o3], then o4..o7) - the operand of `sdot` by
+// element, which multiplies them by 4 k of one activation row (a lane) into the 4 outputs' sums. int4: one vector per
+// 4 outputs and 8 k, low nibbles the 4 k at k, high nibbles those at k + 4. Activations: plain int8 rows (`pack_rows`).
 
 /// How `Quant` multiplies, picked once from the CPU.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -306,13 +311,11 @@ pub enum Path {
     Wasm,
 }
 
-/// Lanes of a 2 x 2 result block (row offset, output offset). Kernels hand back the `smmla` order; `Dot` accumulates in
-/// its own (the activation scales are packed to match) and reorders at the end.
 /// Row pairs per kernel call at most (i8mm: 4, the others 2).
 const RPMAX: usize = 4;
 
+/// Lanes of a 2 x 2 result block (row offset, output offset), the `smmla` order: every pair-layout kernel hands it back.
 const MMLA_LANES: [(usize, usize); 4] = [(0, 0), (0, 1), (1, 0), (1, 1)];
-const DOT_LANES: [(usize, usize); 4] = [(0, 0), (1, 1), (1, 0), (0, 1)];
 
 /// The integer kernel of this CPU. std builds: TINYASR_KERNEL=f32|scalar|neon|dot|i8mm forces one (for tests;
 /// one the CPU lacks is ignored); INT8_DOT=0 is TINYASR_KERNEL=f32.
@@ -379,6 +382,18 @@ pub fn path() -> Path {
     }
 }
 
+/// Whether the CPU has i8mm (with dotprod).
+#[cfg(target_arch = "aarch64")]
+fn has_i8mm() -> bool {
+    #[cfg(feature = "std")]
+    return std::arch::is_aarch64_feature_detected!("i8mm") && std::arch::is_aarch64_feature_detected!("dotprod");
+    #[cfg(not(feature = "std"))]
+    {
+        let (mmla, dot) = cpu_features();
+        mmla && dot
+    }
+}
+
 /// (i8mm, dotprod) without std: what the kernel reports (Linux, Android: auxiliary vector), sysctl (Apple), else what
 /// the build targets.
 #[cfg(all(target_arch = "aarch64", not(feature = "std")))]
@@ -423,8 +438,36 @@ pub struct Quant {
     pub k: usize,
     group: usize,
     int4: bool,
+    lay: Lay,
     w: Vec<u8>,   // ceil(n / 8) panels of k * 8 (int8) or k * 4 (int4) bytes
     s: Vec<f32>, // ceil(n / 8) panels x k / group groups x 8 scales
+}
+
+/// The weight layout, chosen at load for the path that multiplies it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Lay {
+    /// Panels of 8 outputs in pairs (`smmla`, plain NEON, wasm, portable).
+    Pair,
+    /// Panels of 8 outputs, 4 outputs x 4 k per vector (`sdot` by element).
+    Dot4,
+}
+
+impl Lay {
+    /// Outputs per panel.
+    fn width(self) -> usize {
+        8
+    }
+}
+
+/// Where weight (output o of a panel, k index kk) is in the panel: (byte, in the high nibble) - int4: nibbles.
+#[inline(always)]
+fn place(lay: Lay, int4: bool, o: usize, kk: usize) -> (usize, bool) {
+    match (lay, int4) {
+        (Lay::Pair, false) => ((o / 2) * 16 + (o % 2) * 8 + (kk / 8) * 64 + kk % 8, false),
+        (Lay::Pair, true) => ((o / 2) * 16 + (o % 2) * 8 + (kk / 16) * 64 + kk % 8, (kk / 8) % 2 == 1),
+        (Lay::Dot4, false) => ((kk / 4) * 32 + (o / 4) * 16 + (o % 4) * 4 + kk % 4, false),
+        (Lay::Dot4, true) => ((kk / 8) * 32 + (o / 4) * 16 + (o % 4) * 4 + kk % 4, (kk / 4) % 2 == 1),
+    }
 }
 
 /// Activations quantized to int8 per row and per group, rows interleaved in pairs (see above).
@@ -437,46 +480,51 @@ impl Quant {
     /// From codes (int8 values, or int4 in -8..=7) and the scale of each (row, group); `group` divides k and is a
     /// multiple of 16.
     pub fn new(n: usize, k: usize, group: usize, int4: bool, code: impl Fn(usize, usize) -> i8, scale: impl Fn(usize, usize) -> f32) -> Quant {
+        let lay = if path() == Path::Dot { Lay::Dot4 } else { Lay::Pair };
+        Quant::with_layout(n, k, group, int4, lay, code, scale)
+    }
+
+    /// `lay`: the layout of the path that will multiply it.
+    fn with_layout(n: usize, k: usize, group: usize, int4: bool, lay: Lay, code: impl Fn(usize, usize) -> i8, scale: impl Fn(usize, usize) -> f32) -> Quant {
         assert!(n > 0 && group > 0 && group.is_multiple_of(16) && k.is_multiple_of(group));
-        let pb = k * if int4 { 4 } else { 8 };
+        let wd = lay.width();
+        let pb = k * wd / if int4 { 2 } else { 1 };
         let ng = k / group;
-        let mut w = vec![0u8; n.div_ceil(8) * pb];
-        let mut s = vec![0f32; n.div_ceil(8) * ng * 8];
+        let np = n.div_ceil(wd);
+        let mut w = vec![0u8; np * pb];
+        let mut s = vec![0f32; np * ng * wd];
         for j in 0..n {
-            let (jp, o) = (j / 8, j % 8);
-            let base = jp * pb + (o / 2) * 16 + (o % 2) * 8;
+            let (jp, o) = (j / wd, j % wd);
             for kk in 0..k {
                 let v = code(j, kk);
+                let (b, hi) = place(lay, int4, o, kk);
                 if int4 {
                     debug_assert!((-8..=7).contains(&v));
                     let nib = v as u8 & 15;
-                    w[base + (kk / 16) * 64 + kk % 8] |= if (kk / 8).is_multiple_of(2) { nib } else { nib << 4 };
+                    w[jp * pb + b] |= if hi { nib << 4 } else { nib };
                 } else {
-                    w[base + (kk / 8) * 64 + kk % 8] = v as u8;
+                    w[jp * pb + b] = v as u8;
                 }
             }
             for c in 0..ng {
-                s[(jp * ng + c) * 8 + o] = scale(j, c) / if int4 { 16.0 } else { 1.0 };
+                s[(jp * ng + c) * wd + o] = scale(j, c) / if int4 { 16.0 } else { 1.0 };
             }
         }
-        Quant { n, k, group, int4, w, s }
+        Quant { n, k, group, int4, lay, w, s }
     }
 
     fn panel_bytes(&self) -> usize {
-        self.k * if self.int4 { 4 } else { 8 }
+        self.k * self.lay.width() / if self.int4 { 2 } else { 1 }
     }
 
     /// Weight (j, kk) as the kernels see it (int4: times 16) and its scale.
     fn at(&self, j: usize, kk: usize) -> (i8, f32) {
-        let (jp, o) = (j / 8, j % 8);
-        let base = jp * self.panel_bytes() + (o / 2) * 16 + (o % 2) * 8 + kk % 8;
-        let v = if self.int4 {
-            let b = self.w[base + (kk / 16) * 64];
-            (if (kk / 8).is_multiple_of(2) { b << 4 } else { b & 0xf0 }) as i8
-        } else {
-            self.w[base + (kk / 8) * 64] as i8
-        };
-        (v, self.s[(jp * (self.k / self.group) + kk / self.group) * 8 + o])
+        let wd = self.lay.width();
+        let (jp, o) = (j / wd, j % wd);
+        let (b, hi) = place(self.lay, self.int4, o, kk);
+        let b = self.w[jp * self.panel_bytes() + b];
+        let v = if self.int4 { (if hi { b & 0xf0 } else { b << 4 }) as i8 } else { b as i8 };
+        (v, self.s[(jp * (self.k / self.group) + kk / self.group) * wd + o])
     }
 
     /// out (m x n) = a (m x k) * W^T (+ bias).
@@ -489,8 +537,18 @@ impl Quant {
             blocked(a, self, bias, &mut out);
             return out;
         }
+        match self.lay {
+            Lay::Dot4 => return self.gemm4(a, m, bias),
+            Lay::Pair => {}
+        }
+        // the pair layout's own kernels (its layout follows the path; the others meet it only in tests)
+        #[cfg(target_arch = "aarch64")]
+        let path = match path {
+            Path::Dot if has_i8mm() => Path::Mmla,
+            Path::Dot => Path::Neon,
+            p => p,
+        };
         let (n, k, g) = (self.n, self.k, self.group);
-        let dot = path == Path::Dot;
         let pairs = m.div_ceil(2);
         let np = n.div_ceil(8);
         let zero = vec![0f32; if bias.is_some() { 0 } else { np * 8 }];
@@ -502,7 +560,7 @@ impl Quant {
         if threads > 1 && pairs.div_ceil(mbp) < 2 * threads && np >= 2 * threads && work >= crate::par::MIN_WORK {
             // few rows (streaming chunks, decoding): groups of output panels instead, one task each, into their own
             // columns
-            let act = pack_act(a, m, k, g, dot);
+            let act = pack_act(a, m, k, g);
             let pg = np.div_ceil(4 * threads);
             let parts = crate::par::map(np.div_ceil(pg), work, |grp| {
                 let (jp0, jp1) = (grp * pg, (grp * pg + pg).min(np));
@@ -525,7 +583,7 @@ impl Quant {
         crate::par::chunks_mut(&mut out, 2 * mbp * n, work, |blk, out| {
             let (p0, r0) = (blk * mbp, 2 * blk * mbp); // first pair, first row of the block
             let rows = out.len() / n;
-            let act = pack_act(&a[r0 * k..(r0 + rows) * k], rows, k, g, dot);
+            let act = pack_act(&a[r0 * k..(r0 + rows) * k], rows, k, g);
             self.block(path, &act, p0, (p0 + mbp).min(pairs), m, 0, np, bias, out, r0, 0, n);
         });
         out
@@ -547,7 +605,7 @@ impl Quant {
                 let rp = if path == Path::Mmla && p1 - p >= 4 { 4 } else if p1 - p >= 2 { 2 } else { 1 };
                 let (a, sa) = (&act.q[(p - p0) * 2 * k..(p - p0 + rp) * 2 * k], &act.s[(p - p0) * ng * 4..(p - p0 + rp) * ng * 4]);
                 let mut t = [[[0f32; 4]; 4]; RPMAX];
-                tile(path, rp, rp == 1 && 2 * p + 1 == m, self.int4, a, sa, w, sw, k, g, &mut t);
+                tile(path, rp, self.int4, a, sa, w, sw, k, g, &mut t);
                 for (r, t) in t.iter().enumerate().take(rp) {
                     let rr = 2 * (p + r);
                     if rr + 2 <= m && j0 + 8 <= n {
@@ -578,9 +636,126 @@ impl Quant {
     }
 }
 
+impl Quant {
+    /// `gemm` for the `sdot` layout: blocks of rows (or, few rows, groups of output panels), one task each.
+    fn gemm4(&self, a: &[f32], m: usize, bias: Option<&[f32]>) -> Vec<f32> {
+        let (n, k, g) = (self.n, self.k, self.group);
+        let np = n.div_ceil(8);
+        let zero = vec![0f32; if bias.is_some() { 0 } else { np * 8 }];
+        let bias = bias.unwrap_or(&zero);
+        let mut out = vec![0.0; m * n];
+        let work = m * n * k;
+        let mb = crate::par::block_rows(m, 32);
+        let threads = crate::par::threads();
+        if threads > 1 && m.div_ceil(mb) < 2 * threads && np >= 2 * threads && work >= crate::par::MIN_WORK {
+            let (q, sa) = pack_rows(a, m, k, g);
+            let pg = np.div_ceil(4 * threads);
+            let parts = crate::par::map(np.div_ceil(pg), work, |grp| {
+                let (jp0, jp1) = (grp * pg, (grp * pg + pg).min(np));
+                let w = (jp1 - jp0) * 8;
+                let mut o = vec![0f32; m * w];
+                self.block4(&q, &sa, m, jp0, jp1, bias, &mut o, jp0 * 8, w);
+                o
+            });
+            for (grp, o) in parts.iter().enumerate() {
+                let j0 = grp * pg * 8;
+                let w = o.len() / m;
+                let c = w.min(n - j0);
+                for r in 0..m {
+                    out[r * n + j0..r * n + j0 + c].copy_from_slice(&o[r * w..r * w + c]);
+                }
+            }
+            return out;
+        }
+        crate::par::chunks_mut(&mut out, mb * n, work, |blk, out| {
+            let (r0, rows) = (blk * mb, out.len() / n);
+            let (q, sa) = pack_rows(&a[r0 * k..(r0 + rows) * k], rows, k, g);
+            self.block4(&q, &sa, rows, 0, np, bias, out, 0, n);
+        });
+        out
+    }
+
+    /// `rows` activation rows (`q`, `sa`) x output panels jp0..jp1 into `out` (row r, column j at r * stride + j - c0).
+    #[allow(clippy::too_many_arguments)]
+    fn block4(&self, q: &[i8], sa: &[f32], rows: usize, jp0: usize, jp1: usize, bias: &[f32], out: &mut [f32], c0: usize, stride: usize) {
+        let (n, k, g) = (self.n, self.k, self.group);
+        let ng = k / g;
+        let pb = self.panel_bytes();
+        assert!(q.len() >= rows * k && sa.len() >= rows * ng && g.is_multiple_of(16));
+        for jp in jp0..jp1 {
+            let w = &self.w[jp * pb..(jp + 1) * pb];
+            let sw = &self.s[jp * ng * 8..(jp + 1) * ng * 8];
+            let j0 = jp * 8;
+            let cols = 8.min(n - j0);
+            let mut r = 0;
+            while r < rows {
+                let rr = 4.min(rows - r);
+                let mut t = [[0f32; 8]; 4];
+                tile4(rr, self.int4, &q[r * k..(r + rr) * k], &sa[r * ng..(r + rr) * ng], w, sw, k, g, &mut t);
+                for (i, t) in t.iter().enumerate().take(rr) {
+                    let o = (r + i) * stride + j0 - c0;
+                    for l in 0..cols {
+                        out[o + l] = t[l] + bias[j0 + l];
+                    }
+                }
+                r += rr;
+            }
+        }
+    }
+}
+
+/// `rr` (1..=4) activation rows x one panel (8 outputs) in the `sdot` layout -> t[row][output].
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn tile4(rr: usize, int4: bool, a: &[i8], sa: &[f32], w: &[u8], sw: &[f32], k: usize, g: usize, t: &mut [[f32; 8]; 4]) {
+    let ng = k / g;
+    assert!((1..=4).contains(&rr) && a.len() >= rr * k && sa.len() >= rr * ng);
+    assert!(w.len() >= k * if int4 { 4 } else { 8 } && sw.len() >= ng * 8 && g.is_multiple_of(16) && k.is_multiple_of(g));
+    #[cfg(target_arch = "aarch64")]
+    #[allow(unsafe_code)]
+    // SAFETY: the `sdot` layout is built only on the dotprod path (`Quant::new`); reads stay inside the slices
+    // asserted above (row r: a[r*k..], sa[r*ng..]; the panel w[..k*8 or k*4], sw[..ng*8]).
+    unsafe {
+        macro_rules! go {
+            ($r:literal) => {
+                if int4 {
+                    neon::dot4::<$r, true>(a.as_ptr(), sa.as_ptr(), w.as_ptr(), sw.as_ptr(), k, g, t)
+                } else {
+                    neon::dot4::<$r, false>(a.as_ptr(), sa.as_ptr(), w.as_ptr(), sw.as_ptr(), k, g, t)
+                }
+            };
+        }
+        match rr {
+            4 => go!(4),
+            3 => go!(3),
+            2 => go!(2),
+            _ => go!(1),
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        // portable (the layout is built only for the aarch64 `sdot` path; this keeps other targets compiling)
+        for r in 0..rr {
+            for o in 0..8 {
+                let mut f = 0f32;
+                for c in 0..ng {
+                    let mut d = 0i32;
+                    for kk in c * g..(c + 1) * g {
+                        let (b, hi) = place(Lay::Dot4, int4, o, kk);
+                        let v = if int4 { (if hi { w[b] & 0xf0 } else { w[b] << 4 }) as i8 } else { w[b] as i8 };
+                        d += a[r * k + kk] as i32 * v as i32;
+                    }
+                    f += d as f32 * (sw[c * 8 + o] * sa[r * ng + c]);
+                }
+                t[r][o] = f;
+            }
+        }
+    }
+}
+
 /// Rows of `a` (k each) -> int8 per `g` values, interleaved in row pairs; lane scales in the order of the kernel's
-/// 2 x 2 blocks (`dot`: DOT_LANES, else MMLA_LANES).
-fn pack_act(a: &[f32], m: usize, k: usize, g: usize, dot: bool) -> Act {
+/// 2 x 2 blocks (MMLA_LANES).
+fn pack_act(a: &[f32], m: usize, k: usize, g: usize) -> Act {
     let pairs = m.div_ceil(2);
     let ng = k / g;
     let mut q = vec![0i8; pairs * 2 * k];
@@ -598,21 +773,35 @@ fn pack_act(a: &[f32], m: usize, k: usize, g: usize, dot: bool) -> Act {
                 quant8(&x[st * 8..st * 8 + 8], inv, &mut dst[o..o + 8]);
             }
             let sv = &mut s[(p * ng + c) * 4..(p * ng + c + 1) * 4];
-            let lanes = if dot { &DOT_LANES } else { &MMLA_LANES };
-            for (l, &(ri, _)) in lanes.iter().enumerate() {
-                // `dot`: a lone last row fills the whole pair (both halves are it: see `neon::dot`, SINGLE)
-                if ri == h || dot && r + 1 == m && h == 0 {
+            for (l, &(ri, _)) in MMLA_LANES.iter().enumerate() {
+                if ri == h {
                     sv[l] = max / 127.0;
                 }
             }
         }
-        if dot && r + 1 == m && h == 0 {
-            for st in 0..k / 8 {
-                dst.copy_within(st * 16..st * 16 + 8, st * 16 + 8);
-            }
-        }
     }
     Act { q, s }
+}
+
+/// Rows of `a` (k each) -> plain int8 rows (m x k) and one scale per row and group (m x k / g): the `sdot` path's
+/// activations, quantized exactly as `pack_act` does.
+fn pack_rows(a: &[f32], m: usize, k: usize, g: usize) -> (Vec<i8>, Vec<f32>) {
+    let ng = k / g;
+    let mut q = vec![0i8; m * k];
+    let mut s = vec![0f32; m * ng];
+    for r in 0..m {
+        for c in 0..ng {
+            let x = &a[r * k + c * g..r * k + (c + 1) * g];
+            let max = absmax(x);
+            let inv = if max > 0.0 { 127.0 / max } else { 0.0 };
+            for st in 0..g / 8 {
+                let o = r * k + c * g + st * 8;
+                quant8(&x[st * 8..st * 8 + 8], inv, &mut q[o..o + 8]);
+            }
+            s[r * ng + c] = max / 127.0;
+        }
+    }
+    (q, s)
 }
 
 #[inline(always)]
@@ -651,14 +840,13 @@ fn quant8(x: &[f32], inv: f32, out: &mut [i8]) {
 /// One kernel call: rp (1, 2) row pairs x the 4 output pairs of one panel, 2 x 2 blocks of f32 into t[row pair][pair].
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-fn tile(path: Path, rp: usize, single: bool, int4: bool, a: &[i8], sa: &[f32], w: &[u8], sw: &[f32], k: usize, g: usize, t: &mut [[[f32; 4]; 4]; RPMAX]) {
+fn tile(path: Path, rp: usize, int4: bool, a: &[i8], sa: &[f32], w: &[u8], sw: &[f32], k: usize, g: usize, t: &mut [[[f32; 4]; 4]; RPMAX]) {
     let ng = k / g;
-    let _ = single; // the `sdot` path only
     assert!((1..=RPMAX).contains(&rp) && (rp <= 2 || path == Path::Mmla) && a.len() >= rp * 2 * k && sa.len() >= rp * ng * 4);
     assert!(w.len() >= k * if int4 { 4 } else { 8 } && sw.len() >= ng * 8 && g.is_multiple_of(16) && k.is_multiple_of(g));
     match path {
         #[cfg(target_arch = "aarch64")]
-        Path::Mmla | Path::Dot | Path::Neon => {
+        Path::Mmla | Path::Neon => {
             #[allow(unsafe_code)]
             // SAFETY: the path was picked for this CPU's features (`path`); every read stays inside the slices asserted
             // above (row pair r: a[r*2k + 0..2k], sa[r*ng*4 + 0..ng*4]; the panel: w[0..k*8 or k*4], sw[0..ng*8]).
@@ -674,14 +862,6 @@ fn tile(path: Path, rp: usize, single: bool, int4: bool, a: &[i8], sa: &[f32], w
                     };
                 }
                 match path {
-                    Path::Dot if single => {
-                        // one row (packed twice): the diagonal sdot gives both of its outputs per pair
-                        if int4 {
-                            neon::dot::<1, true, true>(a.as_ptr(), sa.as_ptr(), w.as_ptr(), sw.as_ptr(), k, g, t)
-                        } else {
-                            neon::dot::<1, false, true>(a.as_ptr(), sa.as_ptr(), w.as_ptr(), sw.as_ptr(), k, g, t)
-                        }
-                    }
                     Path::Mmla if rp == 4 => {
                         if int4 {
                             neon::mmla::<4, true>(a.as_ptr(), sa.as_ptr(), w.as_ptr(), sw.as_ptr(), k, g, t)
@@ -690,7 +870,6 @@ fn tile(path: Path, rp: usize, single: bool, int4: bool, a: &[i8], sa: &[f32], w
                         }
                     }
                     Path::Mmla => go!(mmla),
-                    Path::Dot => go!(dot2),
                     _ => go!(plain),
                 }
             }
@@ -781,13 +960,6 @@ mod neon {
             core::arch::asm!("smmla {acc:v}.4s, {a:v}.16b, {w:v}.16b", acc = inout(vreg) $acc, a = in(vreg) $a, w = in(vreg) $w, options(pure, nomem, nostack))
         };
     }
-    macro_rules! sdot {
-        ($acc:expr, $a:expr, $w:expr) => {
-            // sdot (vdotq_s32 is still unstable in core::arch)
-            core::arch::asm!("sdot {acc:v}.4s, {a:v}.16b, {w:v}.16b", acc = inout(vreg) $acc, a = in(vreg) $a, w = in(vreg) $w, options(pure, nomem, nostack))
-        };
-    }
-
     /// i8mm: one smmla per (row pair, output pair) and 8 k gives the whole 2 x 2 block.
     #[target_feature(enable = "i8mm")]
     pub unsafe fn mmla<const RP: usize, const INT4: bool>(a: *const i8, sa: *const f32, w: *const u8, sw: *const f32, k: usize, g: usize, t: &mut [[[f32; 4]; 4]; super::RPMAX]) {
@@ -837,79 +1009,61 @@ mod neon {
 
     /// dotprod: per (row pair, output pair) and 8 k, sdot of [r0|r1] . [o0|o1] (r0 o0, r1 o1) and of [r1|r0] . [o0|o1]
     /// (r1 o0, r0 o1), two lanes each; added pairwise at the group end: DOT_LANES. Two output pairs at a time (registers).
-    /// `dot` for full row pairs (`go!` takes kernels with two const parameters).
-    #[inline(always)]
-    pub unsafe fn dot2<const RP: usize, const INT4: bool>(a: *const i8, sa: *const f32, w: *const u8, sw: *const f32, k: usize, g: usize, t: &mut [[[f32; 4]; 4]; super::RPMAX]) {
-        // SAFETY: as `dot`.
-        unsafe { dot::<RP, INT4, false>(a, sa, w, sw, k, g, t) }
+    macro_rules! sdot_lane {
+        ($acc:expr, $w:expr, $a:expr, $l:literal) => {
+            // sdot by element (vdotq_laneq_s32 is still unstable in core::arch)
+            core::arch::asm!(concat!("sdot {acc:v}.4s, {w:v}.16b, {a:v}.4b[", $l, "]"), acc = inout(vreg) $acc, w = in(vreg) $w, a = in(vreg) $a, options(pure, nomem, nostack))
+        };
     }
 
-    /// SINGLE (RP = 1): the pair holds one row twice ([r0|r0], `pack_act`); the diagonal sdot alone gives r0 o0 and
-    /// r0 o1, already in MMLA_LANES order (lanes 0, 1), with no cross products.
+    /// dotprod, `sdot` layout: R (1..=4) rows x 8 outputs. Per 16 k: each row's 16 activations in one register, used
+    /// by lane (4 k each) against 2 vectors of 4 outputs x 4 k; one accumulator per (row, 4 outputs), lane = output.
     #[target_feature(enable = "dotprod")]
-    pub unsafe fn dot<const RP: usize, const INT4: bool, const SINGLE: bool>(a: *const i8, sa: *const f32, w: *const u8, sw: *const f32, k: usize, g: usize, t: &mut [[[f32; 4]; 4]; super::RPMAX]) {
+    pub unsafe fn dot4<const R: usize, const INT4: bool>(a: *const i8, sa: *const f32, w: *const u8, sw: *const f32, k: usize, g: usize, t: &mut [[f32; 8]; 4]) {
         let ng = k / g;
-        // SAFETY: as `mmla`.
+        // SAFETY: the caller (`tile4`) guarantees R rows of k activations and ng scales each, and a panel.
         unsafe {
-            let mut accf = [[vdupq_n_f32(0.0); 4]; RP];
-            for half in 0..2 {
-                for c in 0..ng {
-                    let mut ad = [[vdupq_n_s32(0); 2]; RP];
-                    let mut ax = [[vdupq_n_s32(0); 2]; RP];
-                    let mut kk = c * g;
-                    while kk < (c + 1) * g {
-                        if INT4 {
-                            let wp = w.add(kk * 4 + 32 * half) as *const i8;
-                            let wv: [(int8x16_t, int8x16_t); 2] = core::array::from_fn(|p| unpack(vld1q_s8(wp.add(16 * p))));
-                            for r in 0..RP {
-                                let ap = a.add(r * 2 * k + kk * 2);
-                                let (a0, a1) = (vld1q_s8(ap), vld1q_s8(ap.add(16)));
-                                let (x0, x1) = (vextq_s8::<8>(a0, a0), vextq_s8::<8>(a1, a1));
-                                for p in 0..2 {
-                                    sdot!(ad[r][p], a0, wv[p].0);
-                                    sdot!(ad[r][p], a1, wv[p].1);
-                                    if !SINGLE {
-                                        sdot!(ax[r][p], x0, wv[p].0);
-                                        sdot!(ax[r][p], x1, wv[p].1);
-                                    }
-                                }
-                            }
-                            kk += 16;
-                        } else {
-                            let wp = w.add(kk * 8 + 32 * half) as *const i8;
-                            let wv: [int8x16_t; 2] = core::array::from_fn(|p| vld1q_s8(wp.add(16 * p)));
-                            for r in 0..RP {
-                                let a0 = vld1q_s8(a.add(r * 2 * k + kk * 2));
-                                let x0 = vextq_s8::<8>(a0, a0);
-                                for p in 0..2 {
-                                    sdot!(ad[r][p], a0, wv[p]);
-                                    if !SINGLE {
-                                        sdot!(ax[r][p], x0, wv[p]);
-                                    }
-                                }
-                            }
-                            kk += 8;
-                        }
+            let mut accf = [[vdupq_n_f32(0.0); 2]; R];
+            for c in 0..ng {
+                let mut acc = [[vdupq_n_s32(0); 2]; R];
+                let mut kk = c * g;
+                while kk < (c + 1) * g {
+                    let av: [int8x16_t; R] = core::array::from_fn(|r| vld1q_s8(a.add(r * k + kk)));
+                    // the weights of k-steps j = 0..4 (4 k each), outputs 0..4 and 4..8
+                    let wv: [(int8x16_t, int8x16_t); 4] = if INT4 {
+                        let wp = w.add(kk * 4) as *const i8;
+                        let (l0, h0) = unpack(vld1q_s8(wp));
+                        let (l1, h1) = unpack(vld1q_s8(wp.add(16)));
+                        let (l2, h2) = unpack(vld1q_s8(wp.add(32)));
+                        let (l3, h3) = unpack(vld1q_s8(wp.add(48)));
+                        [(l0, l1), (h0, h1), (l2, l3), (h2, h3)]
+                    } else {
+                        let wp = w.add(kk * 8) as *const i8;
+                        core::array::from_fn(|j| (vld1q_s8(wp.add(32 * j)), vld1q_s8(wp.add(32 * j + 16))))
+                    };
+                    for r in 0..R {
+                        sdot_lane!(acc[r][0], wv[0].0, av[r], "0");
+                        sdot_lane!(acc[r][1], wv[0].1, av[r], "0");
+                        sdot_lane!(acc[r][0], wv[1].0, av[r], "1");
+                        sdot_lane!(acc[r][1], wv[1].1, av[r], "1");
+                        sdot_lane!(acc[r][0], wv[2].0, av[r], "2");
+                        sdot_lane!(acc[r][1], wv[2].1, av[r], "2");
+                        sdot_lane!(acc[r][0], wv[3].0, av[r], "3");
+                        sdot_lane!(acc[r][1], wv[3].1, av[r], "3");
                     }
-                    for p in 0..2 {
-                        let pp = 2 * half + p;
-                        let s = wscale(sw.add(c * 8 + 2 * pp));
-                        for r in 0..RP {
-                            let sc = vmulq_f32(vld1q_f32(sa.add((r * ng + c) * 4)), s);
-                            let x = if SINGLE { ad[r][p] } else { ax[r][p] };
-                            accf[r][pp] = vfmaq_f32(accf[r][pp], vcvtq_f32_s32(vpaddq_s32(ad[r][p], x)), sc);
-                        }
-                    }
+                    kk += 16;
+                }
+                let (s0, s1) = (vld1q_f32(sw.add(c * 8)), vld1q_f32(sw.add(c * 8 + 4)));
+                for r in 0..R {
+                    let x = *sa.add(r * ng + c);
+                    accf[r][0] = vfmaq_f32(accf[r][0], vcvtq_f32_s32(acc[r][0]), vmulq_n_f32(s0, x));
+                    accf[r][1] = vfmaq_f32(accf[r][1], vcvtq_f32_s32(acc[r][1]), vmulq_n_f32(s1, x));
                 }
             }
-            // DOT_LANES -> MMLA_LANES: lanes 0, 3, 2, 1 (SINGLE: already)
-            let idx = vld1q_u8([0u8, 1, 2, 3, 12, 13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7].as_ptr());
-            for r in 0..if SINGLE { 0 } else { RP } {
-                for p in 0..4 {
-                    accf[r][p] = vreinterpretq_f32_u8(vqtbl1q_u8(vreinterpretq_u8_f32(accf[r][p]), idx));
-                }
+            for r in 0..R {
+                vst1q_f32(t[r].as_mut_ptr(), accf[r][0]);
+                vst1q_f32(t[r].as_mut_ptr().add(4), accf[r][1]);
             }
-            store(&accf, t);
         }
     }
 
@@ -1296,7 +1450,7 @@ mod tests {
         for &(m, n, k, g, int4) in &[(1, 8, 64, 64, true), (5, 19, 128, 64, true), (33, 40, 512, 64, true), (3, 13, 512, 512, false), (36, 24, 96, 32, false), (2, 7, 32, 16, true)] {
             let codes: Vec<i8> = (0..n * k).map(|_| (rnd(&mut seed) * if int4 { 8.0 } else { 127.0 }).floor().clamp(if int4 { -8.0 } else { -127.0 }, if int4 { 7.0 } else { 127.0 }) as i8).collect();
             let scales: Vec<f32> = (0..n * k / g).map(|_| 0.01 + rnd(&mut seed).abs() * 0.05).collect();
-            let q = Quant::new(n, k, g, int4, |j, p| codes[j * k + p], |j, c| scales[j * (k / g) + c]);
+            let q = Quant::with_layout(n, k, g, int4, Lay::Pair, |j, p| codes[j * k + p], |j, c| scales[j * (k / g) + c]);
             let a: Vec<f32> = (0..m * k).map(|_| rnd(&mut seed)).collect();
             let bias: Vec<f32> = (0..n).map(|_| rnd(&mut seed)).collect();
             let dense: Vec<f32> = (0..n * k).map(|i| codes[i] as f32 * scales[(i / k) * (k / g) + (i % k) / g]).collect();
@@ -1322,16 +1476,13 @@ mod tests {
             #[cfg(target_arch = "aarch64")]
             {
                 paths.push(Path::Neon);
-                if std::arch::is_aarch64_feature_detected!("dotprod") {
-                    paths.push(Path::Dot);
-                }
                 if std::arch::is_aarch64_feature_detected!("i8mm") {
                     paths.push(Path::Mmla);
                 }
             }
             let mut first: Option<Vec<f32>> = None;
             for &path in &paths {
-                let act = pack_act(&a, m, k, g, path == Path::Dot);
+                let act = pack_act(&a, m, k, g);
                 let lanes = &MMLA_LANES;
                 let mut got = vec![0f32; m * n];
                 let pb = k * if int4 { 4 } else { 8 };
@@ -1339,7 +1490,7 @@ mod tests {
                 for p in 0..m.div_ceil(2) {
                     for jp in 0..n.div_ceil(8) {
                         let mut t = [[[0f32; 4]; 4]; RPMAX];
-                        tile(path, 1, 2 * p + 1 == m, int4, &act.q[p * 2 * k..], &act.s[p * ng * 4..], &q.w[jp * pb..], &q.s[jp * ng * 8..], k, g, &mut t);
+                        tile(path, 1, int4, &act.q[p * 2 * k..], &act.s[p * ng * 4..], &q.w[jp * pb..], &q.s[jp * ng * 8..], k, g, &mut t);
                         for pp in 0..4 {
                             for (l, &(ri, oi)) in lanes.iter().enumerate() {
                                 let (r, o) = (2 * p + ri, jp * 8 + 2 * pp + oi);
@@ -1363,6 +1514,26 @@ mod tests {
                     }
                 }
                 first.get_or_insert(got);
+            }
+            // the `sdot` layout, through its driver (dotprod CPUs), and its f32 view
+            let q4 = Quant::with_layout(n, k, g, int4, Lay::Dot4, |j, p| codes[j * k + p], |j, c| scales[j * (k / g) + c]);
+            #[cfg(target_arch = "aarch64")]
+            if std::arch::is_aarch64_feature_detected!("dotprod") {
+                let got = q4.gemm4(&a, m, Some(&bias));
+                let f = first.as_ref().unwrap();
+                for i in 0..m * n {
+                    assert!((got[i] - want[i]).abs() < 1e-3 * (1.0 + want[i].abs()), "sdot m{m} n{n} k{k} [{i}]: {} vs {}", got[i], want[i]);
+                    assert!((got[i] - f[i]).abs() < 1e-4 * (1.0 + f[i].abs()), "sdot vs scalar [{i}]");
+                }
+            }
+            let mut scratch4 = vec![0f32; k * NR];
+            for jp in 0..n.div_ceil(NR) {
+                let pnl = Panels::panel(&q4, jp, &mut scratch4).to_vec();
+                for l in 0..NR.min(n - jp * NR) {
+                    for p in 0..k {
+                        assert_eq!(pnl[p * NR + l], dense[(jp * NR + l) * k + p]);
+                    }
+                }
             }
             // the f32 view of the packed weights is the dense matrix exactly
             let mut scratch = vec![0f32; k * NR];
@@ -1403,13 +1574,21 @@ mod tests {
         for &(m, n, k, g, int4) in &[(1, 2080, 512, 512, false), (4, 2048, 512, 512, false), (16, 1536, 512, 64, true), (300, 768, 256, 64, true), (77, 384, 128, 128, false)] {
             let codes: Vec<i8> = (0..n * k).map(|_| (rnd(&mut seed) * 7.9).floor() as i8).collect();
             let sc: Vec<f32> = (0..n * k / g).map(|_| 0.01 + rnd(&mut seed).abs() * 0.05).collect();
-            let q = Quant::new(n, k, g, int4, |j, p| codes[j * k + p], |j, c| sc[j * (k / g) + c]);
+            let q = Quant::with_layout(n, k, g, int4, Lay::Pair, |j, p| codes[j * k + p], |j, c| sc[j * (k / g) + c]);
             let qf = QuantF::new(n, k, |j, p| codes[j * k + p], |j| sc[j * (k / g)]);
             let a: Vec<f32> = (0..m * k).map(|_| rnd(&mut seed)).collect();
             let bias: Vec<f32> = (0..n).map(|_| rnd(&mut seed)).collect();
             let one = (q.gemm(&a, m, Some(&bias)), qf.gemm(&a, m, Some(&bias)), gemm(&a, m, &Packed::from_rows(&qf_dense(&qf), n, k), None));
             let three = enter(Some(&ex), || (q.gemm(&a, m, Some(&bias)), qf.gemm(&a, m, Some(&bias)), gemm(&a, m, &Packed::from_rows(&qf_dense(&qf), n, k), None)));
             assert!(one == three, "m{m} n{n} k{k}");
+            #[cfg(target_arch = "aarch64")]
+            if std::arch::is_aarch64_feature_detected!("dotprod") {
+                let q4 = Quant::with_layout(n, k, g, int4, Lay::Dot4, |j, p| codes[j * k + p], |j, c| sc[j * (k / g) + c]);
+                let (one, three) = (q4.gemm4(&a, m, Some(&bias)), enter(Some(&ex), || q4.gemm4(&a, m, Some(&bias))));
+                assert!(one == three, "sdot m{m} n{n} k{k}");
+                // and the same bits as the pair layout's integer kernels
+                assert!(one == q.gemm(&a, m, Some(&bias)), "sdot vs pair layout m{m} n{n} k{k}");
+            }
         }
     }
 
