@@ -8,14 +8,16 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::ffi::{c_char, CStr};
 
-use crate::{Event, Files, Lang, Models, Options, Session, Transcription, Word};
+use crate::{Event, Files, Models, Options, Session, Transcription, Word};
 
 pub struct CSession {
+    m: &'static Models,
     s: Session<'static>,
     out: Vec<u8>,
 }
 
 pub struct CFile {
+    m: &'static Models,
     f: Transcription<'static>,
     out: Vec<u8>,
 }
@@ -31,22 +33,24 @@ unsafe fn samples<'a>(p: *const f32, n: usize) -> &'a [f32] {
     if p.is_null() || n == 0 { &[] } else { unsafe { core::slice::from_raw_parts(p, n) } }
 }
 
+/// A string (null or not UTF-8: empty).
 /// # Safety: p is null or a NUL-terminated string.
-unsafe fn lang(p: *const c_char) -> Option<Lang> {
+unsafe fn text<'a>(p: *const c_char) -> &'a str {
     if p.is_null() {
-        return None;
+        return "";
     }
-    unsafe { CStr::from_ptr(p) }.to_str().ok().and_then(Lang::from_code)
+    unsafe { CStr::from_ptr(p) }.to_str().unwrap_or("")
 }
 
-/// A comma-separated list ("en,ru"); null or empty: all.
+/// A comma-separated list of language codes ("en,ru"); null or empty: all.
 /// # Safety: p is null or a NUL-terminated string.
-unsafe fn langs(p: *const c_char) -> Vec<Lang> {
-    if p.is_null() {
-        return Vec::new();
-    }
-    let s = unsafe { CStr::from_ptr(p) }.to_str().unwrap_or("");
-    s.split(',').filter_map(|c| Lang::from_code(c.trim())).collect()
+unsafe fn langs<'a>(p: *const c_char) -> Vec<&'a str> {
+    unsafe { text(p) }.split(',').map(str::trim).filter(|c| !c.is_empty()).collect()
+}
+
+/// The model's NUL-terminated copy of a language code (lives as long as the models).
+fn lang_str(m: &Models, code: &str) -> *const c_char {
+    m.asr.langs.iter().find(|l| l.code == code).map_or(core::ptr::null(), |l| l.code0.as_ptr() as *const c_char)
 }
 
 fn put(out: &mut Vec<u8>, s: &str) -> *const c_char {
@@ -106,7 +110,11 @@ pub fn events_json(ev: &[Event]) -> String {
                 words(tail, &mut o);
                 o.push('}');
             }
-            Event::Language(l) => o.push_str(&format!("{{\"type\":\"language\",\"lang\":\"{}\"}}", l.code())),
+            Event::Language(l) => {
+                o.push_str("{\"type\":\"language\",\"lang\":");
+                esc(l, &mut o);
+                o.push('}');
+            }
             Event::Eou { at, p } => o.push_str(&format!("{{\"type\":\"eou\",\"at\":{at:.2},\"p\":{p:.3}}}")),
         }
     }
@@ -234,6 +242,20 @@ pub unsafe extern "C" fn tinyasr_chunk_ms(m: *const Models) -> u32 {
     unsafe { m.as_ref() }.map_or(0, |m| m.chunk_ms())
 }
 
+/// How many languages the model has.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tinyasr_lang_count(m: *const Models) -> u32 {
+    // SAFETY: m is null or came from tinyasr_load.
+    unsafe { m.as_ref() }.map_or(0, |m| m.asr.langs.len() as u32)
+}
+
+/// The code of the model's i-th language ("en", "uz_cyrillic", ...; valid while the models are loaded), or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tinyasr_lang(m: *const Models, i: u32) -> *const c_char {
+    // SAFETY: m is null or came from tinyasr_load.
+    unsafe { m.as_ref() }.and_then(|m| m.asr.langs.get(i as usize)).map_or(core::ptr::null(), |l| l.code0.as_ptr() as *const c_char)
+}
+
 /// A live session. `langs`: the languages to recognize in, comma-separated ("en,ru"; null or "": all). One fixes the
 /// language; with several the recognizer picks among them, starting from `start_lang` (may be null). `clock`: a monotonic clock in seconds, or null (re-decode time is then estimated).
 /// `beam`: beam width of the full-context passes (0: the default, 4; 1: greedy).
@@ -254,14 +276,12 @@ pub unsafe extern "C" fn tinyasr_session_new(
         opt.beam = beam as usize;
     }
     // SAFETY: null or NUL-terminated strings.
-    if let Some(l) = unsafe { lang(start_lang) } {
-        opt.start_lang = l;
-    }
+    opt.start_lang = unsafe { text(start_lang) }.into();
     if let Some(c) = clock {
         opt.clock = Some(Box::new(move || c()));
     }
     let s = Session::new(m, &unsafe { langs(lang_list) }, opt);
-    Box::into_raw(Box::new(CSession { s, out: Vec::new() }))
+    Box::into_raw(Box::new(CSession { m, s, out: Vec::new() }))
 }
 
 /// Feed n samples (16 kHz); returns the events (JSON array).
@@ -286,11 +306,11 @@ pub unsafe extern "C" fn tinyasr_session_finish(s: *mut CSession) -> *const c_ch
     put(&mut s.out, &e)
 }
 
-/// The session's language code (static string).
+/// The session's language code (valid while the models are loaded).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tinyasr_session_lang(s: *const CSession) -> *const c_char {
     // SAFETY: s is null or came from tinyasr_session_new.
-    unsafe { s.as_ref() }.map_or(core::ptr::null(), |s| lang_str(s.s.lang()))
+    unsafe { s.as_ref() }.map_or(core::ptr::null(), |s| lang_str(s.m, s.s.lang()))
 }
 
 #[unsafe(no_mangle)]
@@ -299,10 +319,6 @@ pub unsafe extern "C" fn tinyasr_session_free(s: *mut CSession) {
         // SAFETY: s came from tinyasr_session_new.
         drop(unsafe { Box::from_raw(s) });
     }
-}
-
-fn lang_str(l: Lang) -> *const c_char {
-    [c"en", c"ru", c"uk", c"es", c"it", c"pt", c"uz", c"fa", c"km"][l as usize].as_ptr()
 }
 
 /// A recorded file (n samples, 16 kHz, copied): VAD runs here. `langs` and `beam` as for sessions.
@@ -316,13 +332,13 @@ pub unsafe extern "C" fn tinyasr_file_new(m: *const Models, pcm: *const f32, n: 
     let x = unsafe { samples(pcm, n) };
     let beam = if beam > 0 { beam as usize } else { crate::DEFAULT_BEAM };
     let f = Transcription::new(m, x, &unsafe { langs(lang_list) }, beam);
-    Box::into_raw(Box::new(CFile { f, out: Vec::new() }))
+    Box::into_raw(Box::new(CFile { m, f, out: Vec::new() }))
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tinyasr_file_lang(f: *const CFile) -> *const c_char {
     // SAFETY: f is null or came from tinyasr_file_new.
-    unsafe { f.as_ref() }.map_or(core::ptr::null(), |f| lang_str(f.f.lang()))
+    unsafe { f.as_ref() }.map_or(core::ptr::null(), |f| lang_str(f.m, f.f.lang()))
 }
 
 /// The next piece's final words (JSON array of {"text", "start", "end"}), or null when the file is done.

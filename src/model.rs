@@ -22,6 +22,7 @@ use alloc::format;
 
 pub struct Tensors<'a> {
     cfg: BTreeMap<String, i32>,
+    text: BTreeMap<String, String>, // TZF3: text settings (language codes and rules)
     t: BTreeMap<String, (Vec<usize>, Data<'a>)>,
     pub pieces: Vec<String>,
 }
@@ -156,20 +157,29 @@ impl<'a> Rd<'a> {
 }
 
 impl<'a> Tensors<'a> {
-    /// The `.tzf` file written by `export_tzf.py` (TZF1: f32) or `export_tzf2.py` (TZF2: integer weights). Every size
-    /// is checked against the file, so a corrupted file is an error here, never a crash.
+    /// The `.tzf` file written by `export_tzf.py` (TZF1: f32) or `export_tzf2.py` (TZF2: integer weights; TZF3: as
+    /// TZF2 plus text settings after the integer ones). Every size is checked against the file, so a corrupted file is
+    /// an error here, never a crash.
     pub fn parse(b: &'a [u8]) -> R<Tensors<'a>> {
         let mut r = Rd { b, p: 0 };
-        let v2 = match r.take(4)? {
-            b"TZF1" => false,
-            b"TZF2" => true,
-            _ => return Err("not a tinyasr model file (TZF1/TZF2)"),
+        let (v2, v3) = match r.take(4)? {
+            b"TZF1" => (false, false),
+            b"TZF2" => (true, false),
+            b"TZF3" => (true, true),
+            _ => return Err("not a tinyasr model file (TZF1/TZF2/TZF3)"),
         };
         let mut cfg = BTreeMap::new();
         for _ in 0..r.u32()? {
             let k = r.str()?;
             let v = r.take(4)?;
             cfg.insert(k, i32::from_le_bytes([v[0], v[1], v[2], v[3]]));
+        }
+        let mut text = BTreeMap::new();
+        if v3 {
+            for _ in 0..r.u32()? {
+                let k = r.str()?;
+                text.insert(k, r.str()?);
+            }
         }
         let mut t = BTreeMap::new();
         for _ in 0..r.u32()? {
@@ -208,7 +218,7 @@ impl<'a> Tensors<'a> {
             t.insert(k, (dims, Data::Int(Ints { bits, group, row, scale, raw })));
         }
         let pieces = (0..r.u32()?).map(|_| r.str()).collect::<R<Vec<_>>>()?;
-        Ok(Tensors { cfg, t, pieces })
+        Ok(Tensors { cfg, text, t, pieces })
     }
 
     /// A setting, which must lie in lo..=hi.
@@ -1106,13 +1116,81 @@ pub struct Model {
     pub chunk: usize,
     pub pieces: Vec<String>,
     /// The languages, in the model's order (its lang_embed rows and output blocks).
-    pub langs: Vec<crate::Lang>,
+    pub langs: Vec<LangInfo>,
+}
+
+/// A language of the model: its code and how its text is written, all from the model file (TZF3: "lang.K" = code,
+/// "lang.K.full_stop", "lang.K.quotes", "lang.K.own", "lang.K.syllables"; older files: [`legacy_langs`]).
+pub struct LangInfo {
+    pub code: String,
+    /// `code` NUL-terminated (the C API hands it out).
+    pub code0: String,
+    /// The full stop a sentence gets when the model wrote none.
+    pub full_stop: char,
+    /// What the model's « » are shown as (None: as written).
+    pub quotes: Option<(char, char)>,
+    /// Letters of the shared token block only this language may write (another language's tokens with them are left out).
+    pub own: String,
+    /// Words with Khmer letters come out as timed syllables (Khmer writes no spaces inside a phrase).
+    pub syllables: bool,
+}
+
+impl LangInfo {
+    fn new(code: &str) -> LangInfo {
+        LangInfo { code: code.into(), code0: format!("{code}\0"), full_stop: '.', quotes: None, own: String::new(), syllables: false }
+    }
+}
+
+/// The languages of a TZF1/TZF2 file (library version 2): "lang.K" = index into the codes of that version (files from
+/// en-ru-uz on), older files by their count; the writing rules of those models.
+fn legacy_langs(w: &Tensors, n: usize) -> R<Vec<LangInfo>> {
+    const V2: [&str; 9] = ["en", "ru", "uk", "es", "it", "pt", "uz", "fa", "km"];
+    let codes: Vec<&str> = if w.cfg.contains_key("lang.0") {
+        (0..n).map(|k| w.c(&format!("lang.{k}"), 0, V2.len() - 1).map(|i| V2[i])).collect::<R<_>>()?
+    } else {
+        match n {
+            3 => vec!["en", "ru", "uk"],
+            4 => vec!["en", "es", "it", "pt"],
+            _ => return Err("model file: unknown language set"),
+        }
+    };
+    Ok(codes
+        .into_iter()
+        .map(|c| {
+            let mut l = LangInfo::new(c);
+            match c {
+                "uk" => l.own = "ґҐ".into(),
+                "km" => (l.full_stop, l.quotes, l.syllables) = ('។', Some(('“', '”')), true),
+                _ => {}
+            }
+            l
+        })
+        .collect())
+}
+
+/// The languages of a TZF3 file: every rule from its text settings.
+fn file_langs(w: &Tensors, n: usize) -> R<Vec<LangInfo>> {
+    let one = |k: usize, key: &str| w.text.get(&format!("lang.{k}.{key}")).and_then(|s| s.chars().next());
+    (0..n)
+        .map(|k| {
+            let code = w.text.get(&format!("lang.{k}")).filter(|c| !c.is_empty()).ok_or(SETTING)?;
+            let mut l = LangInfo::new(code);
+            l.full_stop = one(k, "full_stop").unwrap_or('.');
+            l.quotes = w.text.get(&format!("lang.{k}.quotes")).and_then(|q| {
+                let mut c = q.chars();
+                Some((c.next()?, c.next()?))
+            });
+            l.own = w.text.get(&format!("lang.{k}.own")).cloned().unwrap_or_default();
+            l.syllables = w.cfg.get(&format!("lang.{k}.syllables")).is_some_and(|&v| v != 0);
+            Ok(l)
+        })
+        .collect()
 }
 
 impl Model {
-    /// `l`'s place among the model's languages (its first, English, for one it doesn't have).
-    pub fn lang_index(&self, l: crate::Lang) -> usize {
-        self.langs.iter().position(|&m| m == l).unwrap_or(0)
+    /// The place of the language with this code among the model's (None: the model has no such language).
+    pub fn lang_index(&self, code: &str) -> Option<usize> {
+        self.langs.iter().position(|l| l.code == code)
     }
 }
 
@@ -1256,23 +1334,9 @@ impl Model {
             out: Linear { w: out_w, b: Some(w.vec("encoder_embed.out.bias", d0)?) },
             norm: BiasNorm::load(&mut w, "encoder_embed.out_norm", d0)?,
         };
-        use crate::Lang;
-        // the language set: "lang.K" = Lang index of the K-th language (files from en-ru-uz on); older files by its size
-        let n = w.c("n_langs", 1, Lang::ALL.len())?;
-        let langs = if w.cfg.contains_key("lang.0") {
-            let mut v = alloc::vec::Vec::new();
-            for k in 0..n {
-                let i = w.c(&alloc::format!("lang.{k}"), 0, Lang::ALL.len() - 1)?;
-                v.push(Lang::ALL[i]);
-            }
-            v
-        } else {
-            match n {
-                3 => alloc::vec![Lang::En, Lang::Ru, Lang::Uk],
-                4 => alloc::vec![Lang::En, Lang::Es, Lang::It, Lang::Pt],
-                _ => return Err("model file: unknown language set"),
-            }
-        };
+        // the languages: the file's own codes and rules (TZF3), or those of the version 2 codes
+        let n = w.c("n_langs", 1, 256)?;
+        let langs = if w.text.is_empty() { legacy_langs(&w, n)? } else { file_langs(&w, n)? };
         let le = w.get("lang_embed.weight")?.1;
         if le.len() < n * d0 {
             return Err(SHAPE);
@@ -1312,9 +1376,12 @@ impl Model {
         let (shared, size) = (shared as u32, size as u32);
         let out = (0..n as u32)
             .map(|k| {
-                // shared block + English; ґ pieces in the shared block (reserved ids, tok_dir/extra.json) only for Ukrainian
-                let uk_only = |i: u32| i < shared && w.pieces.get(i as usize).is_some_and(|p| p.contains('ґ') || p.contains('Ґ'));
-                let mut ids: Vec<u32> = (0..shared + size).filter(|&i| langs[k as usize] == Lang::Uk || !uk_only(i)).collect();
+                // shared block + English; a shared piece with a letter some language owns (ґ: Ukrainian; reserved ids,
+                // tok_dir/extra.json) only for the languages that own it
+                let own = &langs[k as usize].own;
+                let other = |c: char| !own.contains(c) && langs.iter().any(|l| l.own.contains(c));
+                let mut ids: Vec<u32> =
+                    (0..shared + size).filter(|&i| i >= shared || !w.pieces.get(i as usize).is_some_and(|p| p.chars().any(other))).collect();
                 if k != 0 {
                     ids.extend(shared + k * size..shared + (k + 1) * size);
                 }

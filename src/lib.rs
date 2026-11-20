@@ -10,8 +10,9 @@
 //!   words come out piece by piece as they are decoded (an iterator).
 //!
 //! Every model is a file the caller hands over as bytes ([`Files`]): the recognizer (.tzf, int4, with its end-of-turn
-//! head; uncompressed - the host unzips a .tzf.gz) and Silero VAD straight from its ONNX file. Which languages to recognize
-//! in is the host's choice (it may run a language ID such as tinylid first). The host calls in from whatever thread it
+//! head; uncompressed - the host unzips a .tzf.gz) and Silero VAD straight from its ONNX file. Languages are codes the
+//! model file names (`"en"`, `"uz_cyrillic"`, ...; [`Models::langs`]), with their writing rules: the library knows none
+//! of its own. Which ones to recognize in is the host's choice (it may run a language ID such as tinylid first). The host calls in from whatever thread it
 //! likes; the work runs on that thread, or on as many as the host allows ([`Models::set_threads`], or its own
 //! parallel-for: [`Models::set_parallel_for`]), with the same results.
 //!
@@ -19,7 +20,7 @@
 //! # let read = |p: &str| std::fs::read(p).unwrap();
 //! let (asr, vad) = (read("model.tzf"), read("silero_vad.onnx"));
 //! let models = tinyasr::Models::load(tinyasr::Files { asr: &asr, vad: &vad }).unwrap();
-//! let mut s = tinyasr::Session::new(&models, &[tinyasr::Lang::En], Default::default());
+//! let mut s = tinyasr::Session::new(&models, &["en"], Default::default());
 //! let mic: Vec<f32> = vec![0.0; 16000];
 //! for e in s.push(&mic).into_iter().chain(s.finish()) {
 //!     if let tinyasr::Event::Commit(words) = e { println!("{words:?}") }
@@ -62,45 +63,19 @@ pub const SAMPLE_RATE: u32 = 16_000;
 /// Beam width of the full-context pass unless the host sets one ([`Options::beam`], [`Transcription::new`]); 1 is greedy.
 pub const DEFAULT_BEAM: usize = 4;
 
-/// Version of the library (its API and the model files it reads); C: `tinyasr_version()`.
+/// Version of the library (its API and the model files it reads: TZF3, which names its languages, and the older
+/// TZF1/TZF2); C: `tinyasr_version()`.
 pub fn version() -> u32 {
-    2
+    3
 }
 
-/// Recognition languages (the order of the model's language embeddings).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Lang {
-    En = 0,
-    Ru = 1,
-    Uk = 2,
-    Es = 3,
-    It = 4,
-    Pt = 5,
-    Uz = 6,
-    Fa = 7,
-    Km = 8,
-}
-
-impl Lang {
-    pub const ALL: [Lang; 9] = [Lang::En, Lang::Ru, Lang::Uk, Lang::Es, Lang::It, Lang::Pt, Lang::Uz, Lang::Fa, Lang::Km];
-
-    pub fn code(self) -> &'static str {
-        ["en", "ru", "uk", "es", "it", "pt", "uz", "fa", "km"][self as usize]
-    }
-
-    pub fn from_code(c: &str) -> Option<Lang> {
-        Lang::ALL.into_iter().find(|l| l.code() == c)
-    }
-
-}
-
-/// The languages a recognition may use, as the host allows them: one fixes it; with several the recognizer picks
-/// (every full-context pass runs in each of them and keeps the transcript it is most sure of: that many times the
-/// cost of those passes). Only the model's own count; none of them (or empty): all of the model's.
-fn allowed(m: &Models, langs: &[Lang]) -> Vec<Lang> {
-    let own = m.langs();
-    let l: Vec<Lang> = own.iter().copied().filter(|l| langs.contains(l)).collect();
-    if l.is_empty() { own.to_vec() } else { l }
+/// The languages a recognition may use, as the host allows them (codes; places among the model's): one fixes it;
+/// with several the recognizer picks (every full-context pass runs in each of them and keeps the transcript it is most
+/// sure of: that many times the cost of those passes). Only the model's own count; none of them (or empty): all of
+/// the model's.
+fn allowed(m: &Models, langs: &[&str]) -> Vec<usize> {
+    let l: Vec<usize> = (0..m.asr.langs.len()).filter(|&k| langs.contains(&m.asr.langs[k].code.as_str())).collect();
+    if l.is_empty() { (0..m.asr.langs.len()).collect() } else { l }
 }
 
 /// A recognized word: its text (with punctuation) and times (s from the start of the audio). `join`: written without a
@@ -121,8 +96,8 @@ pub enum Event {
     /// The words not final yet, replacing the previous `Partial`: `open` from the full-context re-decode, `tail` from
     /// the streaming pass after it (newest, least sure).
     Partial { open: Vec<Word>, tail: Vec<Word> },
-    /// With several languages: the recognizer switched to this one (words from now on are in it).
-    Language(Lang),
+    /// With several languages: the recognizer switched to this one (its code; words from now on are in it).
+    Language(String),
     /// Diagnostics: the end-of-turn head at a pause (time s, P(the speaker has finished)).
     Eou { at: f32, p: f32 },
 }
@@ -178,9 +153,14 @@ impl Models {
         body()
     }
 
-    /// The languages of the recognizer: en, ru, uk; en, es, it, pt; en, ru, uz; en, fa; or en, km.
-    pub fn langs(&self) -> &[Lang] {
-        &self.asr.langs
+    /// The languages of the recognizer: the codes its file names, in its order.
+    pub fn langs(&self) -> Vec<&str> {
+        self.asr.langs.iter().map(|l| l.code.as_str()).collect()
+    }
+
+    /// The code of the model's `k`-th language.
+    fn code(&self, k: usize) -> &str {
+        &self.asr.langs[k].code
     }
 
     /// Streaming chunk of the recognizer (ms).
@@ -190,13 +170,13 @@ impl Models {
 
     /// The full-context pass in the one of `langs` the model is most sure of (mean token log-probability): (tokens,
     /// that language; None if it wrote nothing).
-    fn full(&self, x: &[f32], langs: &[Lang], beam: usize) -> (Vec<crate::model::Token>, Option<Lang>) {
+    fn full(&self, x: &[f32], langs: &[usize], beam: usize) -> (Vec<crate::model::Token>, Option<usize>) {
         if let [l] = langs {
-            return (self.asr.full(x, self.asr.lang_index(*l), beam), Some(*l));
+            return (self.asr.full(x, *l, beam), Some(*l));
         }
-        let mut best: Option<(f32, Vec<crate::model::Token>, Lang)> = None;
+        let mut best: Option<(f32, Vec<crate::model::Token>, usize)> = None;
         for &l in langs {
-            let t = self.asr.full(x, self.asr.lang_index(l), beam);
+            let t = self.asr.full(x, l, beam);
             let sc = if t.is_empty() { -1e9 } else { t.iter().map(|k| k.logp).sum::<f32>() / t.len() as f32 };
             if best.as_ref().is_none_or(|b| sc > b.0) {
                 best = Some((sc, t, l));
@@ -209,15 +189,16 @@ impl Models {
 
     /// P(the speaker has finished) at the end of `turn` (the audio since the last sentence end, with the pause); None
     /// without the head or for a turn too short to decode.
-    fn eou(&self, turn: &[f32], lang: Lang) -> Option<f32> {
-        self.asr.full_head(turn, self.asr.lang_index(lang)).1
+    fn eou(&self, turn: &[f32], lang: usize) -> Option<f32> {
+        self.asr.full_head(turn, lang).1
     }
 }
 
 /// Session settings.
 pub struct Options {
-    /// With several languages: the one to assume until the first pick (e.g. the last session's, or the UI's).
-    pub start_lang: Lang,
+    /// With several languages: the one to assume until the first pick (its code, e.g. the last session's, or the
+    /// UI's); empty or not allowed: the first allowed.
+    pub start_lang: String,
     /// A monotonic clock (s). Re-decodes are spaced by how long they took, to keep them under ~1/3 of real time on a
     /// slow device; without a clock their time is estimated as `decode_rtf` x the audio.
     pub clock: Option<Box<dyn Fn() -> f64>>,
@@ -229,6 +210,6 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Options {
-        Options { start_lang: Lang::En, clock: None, decode_rtf: 0.1, beam: DEFAULT_BEAM }
+        Options { start_lang: String::new(), clock: None, decode_rtf: 0.1, beam: DEFAULT_BEAM }
     }
 }

@@ -169,15 +169,18 @@ pub fn is_end(w: &str) -> bool {
     w.ends_with(['.', '?', '!', '…', '។', '؟'])
 }
 
-/// The full stop a sentence gets when the model wrote none: Khmer ។, else "."
-pub fn end_mark(lang: crate::Lang) -> char {
-    if lang == crate::Lang::Km { '។' } else { '.' }
+/// The full stop a sentence gets when the model wrote none (the language's, from the model file).
+pub fn end_mark(lang: &crate::model::LangInfo) -> char {
+    lang.full_stop
 }
 
-/// The quote marks as the language writes them: the model writes « » (two shared tokens); Khmer readers expect “ ”
-/// (native speakers, reports/khmer_label_decisions.md).
-pub fn show_quotes(w: String, lang: crate::Lang) -> String {
-    if lang == crate::Lang::Km && w.contains(['«', '»']) { w.replace('«', "“").replace('»', "”") } else { w }
+/// The quote marks as the language writes them: the model writes « » (two shared tokens), shown as the model file
+/// says for the language (Khmer: “ ”).
+pub fn show_quotes(w: String, lang: &crate::model::LangInfo) -> String {
+    match lang.quotes {
+        Some((a, b)) if w.contains(['«', '»']) => w.replace('«', a.encode_utf8(&mut [0; 4])).replace('»', b.encode_utf8(&mut [0; 4])),
+        _ => w,
+    }
 }
 
 /// Without trailing , ; : — – - (Persian ، ؛)

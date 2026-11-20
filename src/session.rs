@@ -19,7 +19,7 @@ use crate::model::Token;
 use crate::compat::F64Ext;
 use crate::text::{W, balance_quotes, cap, end_mark, is_end, norm, show_quotes, spans, trim_trail, units, words};
 use crate::vad::{CHUNK, VadState};
-use crate::{Event, Lang, Models, Options, Word, allowed};
+use crate::{Event, Models, Options, Word, allowed};
 
 pub(crate) const SR: i64 = 16000;
 /// 40 ms frames: the unit of all cuts and of the VAD flags.
@@ -40,8 +40,8 @@ pub struct Session<'m> {
     opt: Options,
     #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
     t_start: std::time::Instant,
-    langs: Vec<Lang>,
-    lang: Lang,
+    langs: Vec<usize>, // places among the model's languages
+    lang: usize,
     stream: crate::model::Stream<'m>,
     h0: i64,
     stoks: Vec<Token>,
@@ -73,11 +73,11 @@ pub struct Session<'m> {
 }
 
 impl<'m> Session<'m> {
-    /// `langs`: the languages to recognize in (empty: all). One fixes the language; with several the recognizer picks
-    /// among them at every re-decode (that many full-context passes each time).
-    pub fn new(m: &'m Models, langs: &[Lang], opt: Options) -> Session<'m> {
+    /// `langs`: the codes of the languages to recognize in (empty: all of the model's). One fixes the language; with
+    /// several the recognizer picks among them at every re-decode (that many full-context passes each time).
+    pub fn new(m: &'m Models, langs: &[&str], opt: Options) -> Session<'m> {
         let langs = allowed(m, langs);
-        let lang = if langs.contains(&opt.start_lang) { opt.start_lang } else { langs[0] };
+        let lang = m.asr.lang_index(&opt.start_lang).filter(|l| langs.contains(l)).unwrap_or(langs[0]);
         Session {
             m,
             #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
@@ -85,7 +85,7 @@ impl<'m> Session<'m> {
             opt,
             langs,
             lang,
-            stream: m.asr.stream(m.asr.lang_index(lang)),
+            stream: m.asr.stream(lang),
             h0: 0,
             stoks: Vec::new(),
             pending: Vec::new(),
@@ -116,9 +116,9 @@ impl<'m> Session<'m> {
         }
     }
 
-    /// The current language (after `finish`: the one the session ended with).
-    pub fn lang(&self) -> Lang {
-        self.lang
+    /// The current language's code (after `finish`: the one the session ended with).
+    pub fn lang(&self) -> &str {
+        self.m.code(self.lang)
     }
 
     /// Feed 16 kHz audio (any length); returns what changed.
@@ -179,11 +179,11 @@ impl<'m> Session<'m> {
         let f0 = self.aud0 / FR;
         // the given texts (capitals) on the words; Khmer words cut into timed syllables
         let mut ws: Vec<W> = ws.iter().zip(texts).map(|(w, text)| W { w: text, ..w.clone() }).collect();
-        if self.lang == Lang::Km {
+        if self.m.asr.langs[self.lang].syllables {
             ws = units(ws);
         }
         let sp = spans(&ws, from, |f| usize::try_from(f - f0).ok().and_then(|i| self.vf.get(i).copied()));
-        ws.into_iter().zip(sp).map(|(w, (start, end))| Word { text: show_quotes(w.w, self.lang), start, end, join: w.join }).collect()
+        ws.into_iter().zip(sp).map(|(w, (start, end))| Word { text: show_quotes(w.w, &self.m.asr.langs[self.lang]), start, end, join: w.join }).collect()
     }
 
     fn stream_words(&self) -> Vec<W> {
@@ -225,7 +225,7 @@ impl<'m> Session<'m> {
 
     /// A stream in the current language over the audio from `from` on (language switch).
     fn new_stream(&mut self, from: i64) {
-        self.stream = self.m.asr.stream(self.m.asr.lang_index(self.lang));
+        self.stream = self.m.asr.stream(self.lang);
         self.h0 = from;
         self.stoks.clear();
         if self.pos > from {
@@ -273,7 +273,7 @@ impl<'m> Session<'m> {
             key.push_str(&w.text);
             key.push(' ');
         }
-        key.push_str(self.lang.code());
+        key.push_str(self.m.code(self.lang));
         if key != self.last_shown {
             self.last_shown = key;
             self.ev.push(Event::Partial { open, tail });
@@ -302,7 +302,7 @@ impl<'m> Session<'m> {
             // the model picked another language: the stream follows
             self.lang = l;
             self.new_stream(self.open0);
-            self.ev.push(Event::Language(l));
+            self.ev.push(Event::Language(self.m.code(l).into()));
         }
         let secs = match (t0, self.now()) {
             (Some(a), Some(b)) => b - a,
@@ -392,7 +392,7 @@ impl<'m> Session<'m> {
         self.turn0 = self.pos;
         let Some(last) = self.open.last_mut() else { return };
         if !is_end(&last.w) {
-            last.w = format!("{}{}", trim_trail(&last.w), end_mark(self.lang));
+            last.w = format!("{}{}", trim_trail(&last.w), end_mark(&self.m.asr.langs[self.lang]));
         }
         self.freeze(self.open.len(), self.pos - FR, 0);
     }

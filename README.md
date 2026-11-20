@@ -27,16 +27,16 @@ WER %, second pass (beam 4) / streaming (greedy)
 
 | Model | Size (gzip) | Language | FLEURS | Common Voice |
 |---|---|---|---|---|
-| `en-ru-uk` (63M, TDT + LSTM) | 31.9 MiB | English | 7.62 / 10.46 | 13.53 / 17.54 |
+| `en-ru-uk` (63M) | 31.9 MiB | English | 7.62 / 10.46 | 13.53 / 17.54 |
 |  |  | Russian | 5.47 / 7.22 | 4.89 / 7.04 |
 |  |  | Ukrainian | 6.13 / 8.22 | 7.78 / 10.29 |
 | `en-es-it-pt` (62M) | 30.7 MiB | English | 9.05 / 11.29 | 14.08 / 17.96 |
 |  |  | Spanish | 5.15 / 6.53 | 7.82 / 10.26 |
 |  |  | Italian | 4.90 / 6.33 | 8.64 / 10.97 |
 |  |  | Portuguese | 6.63 / 8.15 | 6.63 / 8.48 |
-| `en-ru-uz` (61M) | 29.6 MiB | Uzbek | 13.45 / 15.61 | 8.68 / 10.12 |
-|  |  | Russian | 7.62 / 8.42 | 6.81 / 7.85 |
-|  |  | English | 10.26 / 12.08 | 16.48 / 19.18 |
+| `uz` (64M) | 32.6 MiB | Uzbek (Latin) | 10.06 / 12.95 | 7.05 / 9.32 |
+|  |  | Uzbek (Mixed) | 9.69 / 12.67 | 6.81 / 9.24 |
+|  |  | Uzbek (Cyrillic) | 9.95 / 12.86 | 6.93 / 9.36 |
 | `en-fa` (60M) | 28.7 MiB | Persian | 5.87 / 7.23 | 14.29 / 15.98 |
 |  |  | English | 9.97 / 11.04 | 16.26 / 18.06 |
 | `en-km` (60M) | 28.7 MiB | Khmer (CER) | 8.21 / 9.95 | — |

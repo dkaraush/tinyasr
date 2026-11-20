@@ -17,7 +17,8 @@ typedef struct tinyasr_models tinyasr_models;
 typedef struct tinyasr_session tinyasr_session;
 typedef struct tinyasr_file tinyasr_file;
 
-/* Version of the library (its API and the model files it reads): 2. */
+/* Version of the library (its API and the model files it reads): 3. Reads TZF3 model files, which name their
+ * languages, and the TZF1 / TZF2 files of version 2. */
 uint32_t tinyasr_version(void);
 
 /* Model files from memory (copied): the recognizer (.tzf, int4, uncompressed; with its end-of-turn head, else a
@@ -26,6 +27,10 @@ tinyasr_models *tinyasr_load(const uint8_t *asr, size_t asr_len, const uint8_t *
                              size_t err_len);
 void tinyasr_free(tinyasr_models *m);
 uint32_t tinyasr_chunk_ms(const tinyasr_models *m); /* 0 for NULL */
+/* The model's languages: codes its file names ("en", "uz_cyrillic", ...), in its order; the library knows none of its
+ * own. Strings valid while the models are loaded; 0 / NULL for NULL or i out of range. */
+uint32_t tinyasr_lang_count(const tinyasr_models *m);
+const char *tinyasr_lang(const tinyasr_models *m, uint32_t i);
 
 /* Threads. By default every call runs on the thread that makes it. The bigger steps of a pass (matrix products,
  * attention heads, row blocks of a layer) can be split over more threads instead, with the same results to the bit for
@@ -92,9 +97,9 @@ typedef void (*tinyasr_parallel_for)(void *user, size_t n, tinyasr_task task, vo
 void tinyasr_set_threads(tinyasr_models *m, uint32_t threads);
 void tinyasr_set_parallel_for(tinyasr_models *m, tinyasr_parallel_for parallel_for, void *user, uint32_t threads);
 
-/* Live audio. langs: the languages to recognize in, comma-separated ("en", "en,ru"; NULL or "": all), e.g. from a
- * language ID the host runs. One fixes the language; with several every full-context pass runs in each of them and
- * the surest wins (that many times the cost). Starts from start_lang (may be NULL).
+/* Live audio. langs: the codes of the languages to recognize in, comma-separated ("en", "en,ru"; NULL or "": all of
+ * the model's; codes the model lacks are ignored), e.g. from a language ID the host runs. One fixes the language; with several every full-context pass runs in each of them and
+ * the surest wins (that many times the cost). Starts from start_lang (may be NULL: the first).
  * clock: monotonic seconds, or NULL. beam: beam width of the full-context passes (0: the default, 4; 1: greedy,
  * fastest; streaming text is always greedy). push / finish return a JSON array of events:
  *   {"type":"commit","words":[{"text":"Hello,","start":0.52,"end":0.9}, ...]}   final words, appended
@@ -107,7 +112,7 @@ tinyasr_session *tinyasr_session_new(const tinyasr_models *m, const char *langs,
                                      double (*clock)(void), uint32_t beam);
 const char *tinyasr_session_push(tinyasr_session *s, const float *pcm, size_t n);
 const char *tinyasr_session_finish(tinyasr_session *s);
-const char *tinyasr_session_lang(const tinyasr_session *s);
+const char *tinyasr_session_lang(const tinyasr_session *s); /* the current language's code (valid while the models are loaded) */
 void tinyasr_session_free(tinyasr_session *s);
 
 /* A recorded file (copied; langs and beam as for sessions): only the full-context pass, piece by piece. next returns the next piece's final

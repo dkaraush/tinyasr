@@ -14,7 +14,7 @@ use crate::model::Token;
 use crate::session::{CAP, FR, SR, compress, longest_pause};
 use crate::text::{W, balance_quotes, cap, end_mark, is_end, show_quotes, spans, trim_trail, units, words};
 use crate::vad::{CHUNK, VadState};
-use crate::{Lang, Models, Word, allowed};
+use crate::{Models, Word, allowed};
 
 /// Frames of silence that end a sentence.
 const LONG: usize = 75;
@@ -24,8 +24,8 @@ pub struct Transcription<'m> {
     m: &'m Models,
     audio: Vec<f32>, // whole frames
     vf: Vec<bool>,
-    lang: Lang,
-    langs: Vec<Lang>, // the recognizer picks among them for each piece
+    lang: usize,
+    langs: Vec<usize>, // places among the model's languages; the recognizer picks among them for each piece
     beam: usize,
     open0: usize, // frame where the next piece starts
     ctx: usize,   // frames of left context for it
@@ -36,7 +36,7 @@ pub struct Transcription<'m> {
 impl<'m> Transcription<'m> {
     /// `audio`: 16 kHz. `langs`: as for [`crate::Session::new`] (with several, the recognizer picks for each piece).
     /// `beam`: beam width of the decoding ([`crate::DEFAULT_BEAM`]; 1: greedy, fastest).
-    pub fn new(m: &'m Models, audio: &[f32], langs: &[Lang], beam: usize) -> Transcription<'m> {
+    pub fn new(m: &'m Models, audio: &[f32], langs: &[&str], beam: usize) -> Transcription<'m> {
         let mut a = audio.to_vec();
         a.resize(a.len().div_ceil(FR as usize) * FR as usize, 0.0);
         // speech flags per 40 ms frame, from p > 0.5 until p < 0.35 (as live)
@@ -55,9 +55,9 @@ impl<'m> Transcription<'m> {
         Transcription { m, audio: a, vf, lang: langs[0], langs, beam: beam.max(1), open0: 0, ctx: 0, ended: true, last_end: 0.0 }
     }
 
-    /// The language (`Model`: of the last piece).
-    pub fn lang(&self) -> Lang {
-        self.lang
+    /// The language's code (with several: of the last piece).
+    pub fn lang(&self) -> &str {
+        self.m.code(self.lang)
     }
 
     /// Audio length (s).
@@ -73,12 +73,12 @@ impl<'m> Transcription<'m> {
     /// The words out, timed by [`spans`] from the last word given out.
     fn out(&mut self, ws: &[W]) -> Vec<Word> {
         let vf = &self.vf;
-        let ws = if self.lang == Lang::Km { units(ws.to_vec()) } else { ws.to_vec() }; // Khmer: timed syllables
+        let ws = if self.m.asr.langs[self.lang].syllables { units(ws.to_vec()) } else { ws.to_vec() }; // Khmer: timed syllables
         let sp = spans(&ws, self.last_end, |f| usize::try_from(f).ok().and_then(|i| vf.get(i).copied()));
         if let Some(&(_, e)) = sp.last() {
             self.last_end = e as f64;
         }
-        ws.into_iter().zip(sp).map(|(w, (start, end))| Word { text: show_quotes(w.w, self.lang), start, end, join: w.join }).collect()
+        ws.into_iter().zip(sp).map(|(w, (start, end))| Word { text: show_quotes(w.w, &self.m.asr.langs[self.lang]), start, end, join: w.join }).collect()
     }
 }
 
@@ -129,7 +129,7 @@ impl Transcription<'_> {
                 if end {
                     if let Some(last) = ws.last_mut() {
                         if !is_end(&last.w) {
-                            last.w = format!("{}{}", trim_trail(&last.w), end_mark(self.lang));
+                            last.w = format!("{}{}", trim_trail(&last.w), end_mark(&self.m.asr.langs[self.lang]));
                         }
                     }
                 }

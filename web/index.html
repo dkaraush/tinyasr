@@ -179,7 +179,7 @@ const BASE = "../models/";
 const MODELS = [
   { file: "en-ru-uk.tzf", name: "English, Russian, Ukrainian", langs: ["en", "ru", "uk"], mb: 33.4 },
   { file: "en-es-it-pt.tzf", name: "English, Spanish, Italian, Portuguese", langs: ["en", "es", "it", "pt"], mb: 32.2 },
-  { file: "en-ru-uz.tzf", name: "English, Russian, Uzbek", langs: ["en", "ru", "uz"], mb: 31.1 },
+  { file: "uz.tzf", name: "Uzbek", langs: ["uz-Latn", "uz-Latin-Russian", "uz-Cyrl"], mb: 34.2 },
   { file: "en-fa.tzf", name: "English, Persian", langs: ["en", "fa"], mb: 30.1 },
   { file: "en-km.tzf", name: "English, Khmer", langs: ["en", "km"], mb: 30.1 },
 ];
@@ -197,17 +197,46 @@ async function gunzip(buf) {
   if (b[0] !== 0x1f || b[1] !== 0x8b) return buf;
   return new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer();
 }
-const NAMES = { en: "English", ru: "Русский", uk: "Українська", es: "Español", it: "Italiano", pt: "Português", uz: "Özbekça", fa: "فارسی", km: "ខ្មែរ" };
+const NAMES = { en: "English", ru: "Русский", uk: "Українська", es: "Español", it: "Italiano", pt: "Português", uz: "Oʻzbekcha", fa: "فارسی", km: "ខ្មែរ" };
 // Auto-detect: the model each language is recognized with (en, ru: the en-ru-uk model)
 const MODEL_OF = { en: 0, ru: 0, uk: 0, es: 1, it: 1, pt: 1, uz: 2, fa: 3, km: 4 };
 // tinylid runs once the speech heard so far (pauses not counted) is this long; its top language counts when this sure.
 // Later checks hear more and can still correct an earlier verdict (a short window is often unsure or wrong).
 const LID_AT = [[1, 0.85], [2, 0.75], [5, 0.6], [10, 0.6], [20, 0.6]];
-const langName = l => NAMES[l] || (() => { try { return new Intl.DisplayNames(["en"], { type: "language" }).of(l); } catch { return l; } })();
+// a model's code as shown: the language's own name, and for a variant ("uz-Cyrl", "uz-Latin-Russian") its label: the
+// browser's script / region names when it knows each subtag ("Cyrillic"), else the subtags capitalized, joined by ", "
+// ("Latin, Russian"); an app first looks up its own string Language<Subtags> (LanguageUzLatinRussian)
+const base = t => t.split("-")[0].toLowerCase();
+function variantName(tag) {
+  const p = tag.split("-").slice(1);
+  if (!p.length) return null;
+  const ui = navigator.language || "en";
+  const dn = type => { try { return new Intl.DisplayNames([ui], { type, fallback: "none" }); } catch { return null; } };
+  const known = p.map(s => { try { return /^[A-Za-z]{4}$/.test(s) ? dn("script")?.of(s) : /^([A-Za-z]{2}|\d{3})$/.test(s) ? dn("region")?.of(s) : undefined; } catch { return undefined; } });
+  const cap = s => s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
+  return (known.every(Boolean) ? known.map(s => s.charAt(0).toUpperCase() + s.slice(1)) : p.map(cap)).join(", ");
+}
+const langName = l => {
+  const b = base(l), v = variantName(l);
+  const name = NAMES[b] || (() => { try { return new Intl.DisplayNames(["en"], { type: "language" }).of(b); } catch { return b; } })();
+  return v ? `${name} (${v})` : name;
+};
 const auto = () => $("model").value === "auto";
-// every recognition in a language other than English also considers English (all models have it): an English
+// the model's own codes for languages: tinylid's "uz" → the variant picked for it ("uz-Cyrl"; the model's first by
+// default). Every recognition in a language other than English also considers English when the model has it: an English
 // sentence comes out in English even before tinylid notices; the first language stays the session's start
-const withEn = L => L.split(",").includes("en") ? L : L + ",en";
+function codes(file, L) {
+  const M = MODELS.find(m => m.file === file);
+  const out = L.split(",").map(l => M.langs.includes(l) ? l : variantOf(M, l));
+  if (M.langs.includes("en") && !out.includes("en")) out.push("en");
+  return out.join(",");
+}
+function variantOf(M, l) {
+  const v = M.langs.filter(t => base(t) === l);
+  let picked = null;
+  try { picked = localStorage.getItem("tinyasr.variant." + l); } catch {}
+  return v.includes(picked) ? picked : v[0] || l;
+}
 // the last language tinylid was sure of: where the next recording starts (this browser only)
 function lastLang() {
   let l = null;
@@ -225,10 +254,16 @@ function fillLangs() {
   $("lang").hidden = auto();
   if (auto()) return;
   const M = MODELS[+$("model").value], keep = $("lang").value;
-  $("lang").innerHTML = M.langs.map(l => `<option value="${l}">${NAMES[l]}</option>`).join("");
+  $("lang").innerHTML = M.langs.map(l => `<option value="${l}">${esc(langName(l))}</option>`).join("");
   const ui = (navigator.language || "en").slice(0, 2);
-  $("lang").value = M.langs.includes(keep) ? keep : M.langs.includes(ui) ? ui : M.langs[0];
+  const v = variantOf(M, ui);
+  $("lang").value = M.langs.includes(keep) ? keep : M.langs.includes(v) ? v : M.langs[0];
 }
+// a variant picked by hand ("uz-Cyrl") is the one auto-detect uses for its language too
+$("lang").addEventListener("change", () => {
+  const t = $("lang").value;
+  if (t.includes("-")) try { localStorage.setItem("tinyasr.variant." + base(t), t); } catch {}
+});
 
 async function boot() {
   $("model").insertAdjacentHTML("beforeend", `<option value="auto">Auto-detect language</option>`);
@@ -314,13 +349,13 @@ function onWorker(ev) {
       if (e.type === "commit") {
         paras[paras.length - 1].push(...e.words); renderFrozen(); openW = []; tail = [];
       } else if (e.type === "partial") { openW = e.open; tail = e.tail; }
-      else if (e.type === "language" && recording) status(`Listening… language: ${NAMES[e.lang] || e.lang}`);
+      else if (e.type === "language" && recording) status(`Listening… language: ${esc(langName(e.lang))}`);
     }
     show();
   } else if (m.type === "progress") {
     status(`Transcribing… <progress value="${m.done}" max="1"></progress> ${(100 * m.done).toFixed(0)}%`);
   } else if (m.type === "filedone") {
-    status(`Done (${NAMES[m.lang] || m.lang}): ${(1 / m.rtf).toFixed(1)}× faster than real time on this device. Click a word to play from it.`);
+    status(`Done (${esc(langName(m.lang))}): ${(1 / m.rtf).toFixed(1)}× faster than real time on this device. Click a word to play from it.`);
     busy(false);
   }
 }
@@ -440,7 +475,7 @@ $("mic").onclick = async () => {
       if (auto()) autoStep(rec);
     };
     const { stream, ctx } = await openMic(true, onChunk);
-    worker.postMessage({ type: "start", file: MODELS[mi].file, langs: withEn(auto() ? startLang : langs()), start: auto() ? startLang : $("lang").value || (navigator.language || "en").slice(0, 2) });
+    worker.postMessage({ type: "start", file: MODELS[mi].file, langs: codes(MODELS[mi].file, auto() ? startLang : langs()), start: auto() ? codes(MODELS[mi].file, startLang).split(",")[0] : $("lang").value || (navigator.language || "en").slice(0, 2) });
     recording = { stream, ctx, rec };
     $("mic").disabled = false; $("mic").textContent = "■ Stop"; $("mic").classList.add("on");
     status(auto() ? `Listening… (${esc(langName(startLang))}, detecting the language)` : "Listening…");
@@ -500,7 +535,7 @@ async function switchTo(rec, r, c) {
   if ((recording && recording.rec !== rec) || fileMode || rec.cleared || (rec.done && paras[paras.length - 1] !== rec.para)) return;  // something newer started meanwhile
   rec.lang = c ? null : r.lang; rec.langs = c ? L : null; rec.file = MODELS[mi].file;
   const live = recording?.rec === rec;
-  worker.postMessage({ type: "replay", file: rec.file, langs: withEn(L), chunks: recAudio.map(c => c.slice()), finish: !live });
+  worker.postMessage({ type: "replay", file: rec.file, langs: codes(rec.file, L), chunks: recAudio.map(c => c.slice()), finish: !live });
   const what = c ? `${c.langs.map(langName).map(esc).join(" / ")} (tinylid not sure; the recognizer picks)` : `${esc(langName(r.lang))} (detected, ${Math.round(100 * r.p)}%)`;
   status(live ? `Listening… ${what}` : `Done: ${what}`);
 }
@@ -600,7 +635,7 @@ async function transcribeFile(f) {
       await getModel(mi2);
     } else await getModel(mi);
     status("Transcribing…");
-    worker.postMessage({ type: "file", file, x, langs: withEn(L) }, [x.buffer]);
+    worker.postMessage({ type: "file", file, x, langs: codes(file, L) }, [x.buffer]);
   } catch (err) { busy(false); status("Could not decode the file: " + esc(err.message)); }
 }
 $("file").onchange = () => $("file").files[0] && transcribeFile($("file").files[0]);
