@@ -50,7 +50,7 @@ unsafe fn langs<'a>(p: *const c_char) -> Vec<&'a str> {
 
 /// The model's NUL-terminated copy of a language code (lives as long as the models).
 fn lang_str(m: &Models, code: &str) -> *const c_char {
-    m.asr.langs.iter().find(|l| l.code == code).map_or(core::ptr::null(), |l| l.code0.as_ptr() as *const c_char)
+    m.asr.langs.iter().find(|l| l.code.eq_ignore_ascii_case(code)).map_or(core::ptr::null(), |l| l.code0.as_ptr() as *const c_char)
 }
 
 fn put(out: &mut Vec<u8>, s: &str) -> *const c_char {

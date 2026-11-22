@@ -17,8 +17,9 @@ typedef struct tinyasr_models tinyasr_models;
 typedef struct tinyasr_session tinyasr_session;
 typedef struct tinyasr_file tinyasr_file;
 
-/* Version of the library (its API and the model files it reads): 3. Reads TZF3 model files, which name their
- * languages, and the TZF1 / TZF2 files of version 2. */
+/* Version of the library (its API and the model files it reads): 4. Reads TZF4 model files (TZF3 plus a
+ * per-language decoder vector, so a dialect code shapes the output), TZF3 files, which name their languages, and the
+ * TZF1 / TZF2 files of version 2. Language codes are matched case-insensitively. */
 uint32_t tinyasr_version(void);
 
 /* Model files from memory (copied): the recognizer (.tzf, int4, uncompressed; with its end-of-turn head, else a

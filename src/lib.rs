@@ -64,18 +64,19 @@ pub const SAMPLE_RATE: u32 = 16_000;
 /// Beam width of the full-context pass unless the host sets one ([`Options::beam`], [`Transcription::new`]); 1 is greedy.
 pub const DEFAULT_BEAM: usize = 4;
 
-/// Version of the library (its API and the model files it reads: TZF3, which names its languages, and the older
-/// TZF1/TZF2); C: `tinyasr_version()`.
+/// Version of the library (its API and the model files it reads: TZF4, TZF3 plus a per-language decoder vector so a
+/// dialect code shapes the output; TZF3, which names its languages; the older TZF1/TZF2); C: `tinyasr_version()`.
 pub fn version() -> u32 {
-    3
+    4
 }
 
-/// The languages a recognition may use, as the host allows them (codes; places among the model's): one fixes it;
+/// The languages a recognition may use, as the host allows them (codes, any case: BCP 47 tags are case-insensitive;
+/// places among the model's): one fixes it;
 /// with several the recognizer picks (every full-context pass runs in each of them and keeps the transcript it is most
 /// sure of: that many times the cost of those passes). Only the model's own count; none of them (or empty): all of
 /// the model's.
 fn allowed(m: &Models, langs: &[&str]) -> Vec<usize> {
-    let l: Vec<usize> = (0..m.asr.langs.len()).filter(|&k| langs.contains(&m.asr.langs[k].code.as_str())).collect();
+    let l: Vec<usize> = (0..m.asr.langs.len()).filter(|&k| langs.iter().any(|c| c.eq_ignore_ascii_case(&m.asr.langs[k].code))).collect();
     if l.is_empty() { (0..m.asr.langs.len()).collect() } else { l }
 }
 

@@ -166,8 +166,8 @@ impl<'a> Tensors<'a> {
         let (v2, v3) = match r.take(4)? {
             b"TZF1" => (false, false),
             b"TZF2" => (true, false),
-            b"TZF3" => (true, true),
-            _ => return Err("not a tinyasr model file (TZF1/TZF2/TZF3)"),
+            b"TZF3" | b"TZF4" => (true, true), // TZF4 (tinyasr 4): TZF3 + lang_dec (a version 3 library refuses it)
+            _ => return Err("not a tinyasr model file (TZF1/TZF2/TZF3/TZF4)"),
         };
         let mut cfg = BTreeMap::new();
         for _ in 0..r.u32()? {
@@ -1151,6 +1151,9 @@ pub struct Model {
     stacks: Vec<Stack>,
     out_down: Vec<f32>,
     lang_vec: Vec<Vec<f32>>,
+    /// tinyasr 4: per-language vector added to the decoder output (empty in older files), so the language code
+    /// reaches the joiner at every step and not only the encoder input
+    lang_dec: Vec<Vec<f32>>,
     dec_emb: Emb,
     dec_conv: Vec<f32>, // dim x 4 x context (groups of 4 channels)
     dec_dim: usize,
@@ -1235,9 +1238,9 @@ fn file_langs(w: &Tensors, n: usize) -> R<Vec<LangInfo>> {
 }
 
 impl Model {
-    /// The place of the language with this code among the model's (None: the model has no such language).
+    /// The place of the language with this code (any case) among the model's (None: the model has no such language).
     pub fn lang_index(&self, code: &str) -> Option<usize> {
-        self.langs.iter().position(|l| l.code == code)
+        self.langs.iter().position(|l| l.code.eq_ignore_ascii_case(code))
     }
 }
 
@@ -1404,6 +1407,15 @@ impl Model {
             data => Emb::F32(data.f32(&dd), dec_dim),
         };
         let dec_conv = w.vec("decoder.conv.weight", dec_dim * 4 * context)?;
+        let lang_dec: Vec<Vec<f32>> = if w.has("lang_dec.weight") {
+            let ld = w.get("lang_dec.weight")?.1;
+            if ld.len() < n * dec_dim {
+                return Err(SHAPE);
+            }
+            (0..n).map(|k| ld[k * dec_dim..(k + 1) * dec_dim].to_vec()).collect()
+        } else {
+            Vec::new()
+        };
         // joiner: every id a language can emit (< shared + n * lang_size) has an output row and a decoder embedding
         let shared = w.c("shared", 0, 1 << 16)?;
         let size = w.c("lang_size", 0, 1 << 16)?;
@@ -1476,6 +1488,7 @@ impl Model {
             stacks,
             out_down,
             lang_vec,
+            lang_dec,
             dec_emb,
             dec_conv,
             dec_dim,
@@ -1554,11 +1567,14 @@ impl Model {
         self.encode(e, tc, None, &[])
     }
 
-    fn decoder_out(&self, ctx: &[u32], h: &[f32]) -> Vec<f32> {
+    fn decoder_out(&self, ctx: &[u32], h: &[f32], lang: usize) -> Vec<f32> {
         let mut y = self.decoder_y(ctx);
         if let Some(l) = &self.lstm {
             let p = l.proj.apply(h, 1);
             y.iter_mut().zip(&p).for_each(|(a, b)| *a += l.gate * b);
+        }
+        if let Some(v) = self.lang_dec.get(lang) {
+            add(&mut y, v);
         }
         self.joiner.dec.apply(&y, 1)
     }
@@ -1625,6 +1641,13 @@ impl Model {
             let p = l.proj.apply(&hs, n);
             ys.iter_mut().zip(&p).for_each(|(a, b)| *a += l.gate * b);
         }
+        if !self.lang_dec.is_empty() {
+            for (b, dec) in decs.iter().enumerate() {
+                if let Some(v) = self.lang_dec.get(dec.lang) {
+                    add(&mut ys[b * d..(b + 1) * d], v);
+                }
+            }
+        }
         let o = self.joiner.dec.apply(&ys, n);
         let jd = o.len() / n;
         for (b, dec) in decs.iter_mut().enumerate() {
@@ -1651,7 +1674,15 @@ impl Model {
         if let Some(l) = &self.lstm {
             l.step(&self.dec_emb.row(id), &mut dec.h, &mut dec.c);
         }
-        dec.out = self.decoder_out(&dec.ctx, &dec.h);
+        dec.out = self.decoder_out(&dec.ctx, &dec.h, dec.lang);
+    }
+
+    /// Make `dec` decode for `lang` (its decoder output carries the language vector; a stream may switch language).
+    fn ensure_lang(&self, dec: &mut Decoding, lang: usize) {
+        if dec.lang != lang {
+            dec.lang = lang;
+            dec.out = self.decoder_out(&dec.ctx, &dec.h, lang);
+        }
     }
 
 
@@ -1676,6 +1707,7 @@ impl Model {
 
     /// Greedy RNN-T over encoder frames, continuing from `dec`.
     fn greedy(&self, enc: &[f32], t: usize, lang: usize, dec: &mut Decoding, frame0: u32) -> Vec<Token> {
+        self.ensure_lang(dec, lang);
         if let Some(dur) = &self.dur {
             return self.greedy_tdt(dur, enc, t, lang, dec, frame0);
         }
@@ -1707,6 +1739,9 @@ impl Model {
     /// language's tokens; the `beam` best (hypothesis, token) pairs survive, blank keeping the text; at most one token
     /// per frame; hypotheses with the same tokens are merged (log-add). Continues from `hyps`.
     fn beam_rnnt(&self, enc: &[f32], t: usize, lang: usize, hyps: &mut Vec<Hyp>, frame0: u32, beam: usize) {
+        for h in hyps.iter_mut() {
+            self.ensure_lang(&mut h.dec, lang);
+        }
         let ep = self.joiner.enc.apply(enc, t);
         let mut ihc = IhCache::default();
         let (out, ids) = &self.joiner.out[lang];
@@ -1774,7 +1809,7 @@ impl Model {
         if t == 0 {
             return Vec::new();
         }
-        buckets[0] = self.start_beam();
+        buckets[0] = self.start_beam(lang);
         for i in 0..t {
             let mut cur = core::mem::take(&mut buckets[i]);
             for _round in 0..=TDT_MAX_SYM {
@@ -1843,8 +1878,8 @@ impl Model {
         Model::best(&done)
     }
 
-    fn start_beam(&self) -> Vec<Hyp> {
-        vec![Hyp { dec: Decoding::new(self), logp: 0.0, toks: Vec::new(), pending: false }]
+    fn start_beam(&self, lang: usize) -> Vec<Hyp> {
+        vec![Hyp { dec: Decoding::new(self, lang), logp: 0.0, toks: Vec::new(), pending: false }]
     }
 
     fn best(hyps: &[Hyp]) -> Vec<Token> {
@@ -1921,11 +1956,11 @@ impl Model {
                 if let Some(dur) = &self.dur {
                     return self.beam_tdt(dur, enc, te, lang, beam);
                 }
-                let mut hyps = self.start_beam();
+                let mut hyps = self.start_beam(lang);
                 self.beam_rnnt(enc, te, lang, &mut hyps, 0, beam);
                 return Model::best(&hyps);
             }
-            let mut dec = Decoding::new(self);
+            let mut dec = Decoding::new(self, lang);
             self.greedy(enc, te, lang, &mut dec, 0)
         };
         if serial_dec { crate::par::serial(search) } else { search() }
@@ -1948,7 +1983,7 @@ impl Model {
         }
         let d = self.stacks.iter().map(|s| s.dim).max().unwrap_or(0);
         let enc = &enc[..te * d];
-        let mut dec = Decoding::new(self);
+        let mut dec = Decoding::new(self, lang);
         let toks = self.greedy(enc, te, lang, &mut dec, 0);
         let p = self.head.as_ref().map(|h| {
             let n = te.min(HEAD_K);
@@ -1988,20 +2023,21 @@ pub struct Decoding {
     out: Vec<f32>,
     h: Vec<f32>, // LSTM state (empty without the LSTM)
     c: Vec<f32>,
+    lang: usize, // tinyasr 4: the language its decoder output is for (lang_dec)
     skip: usize, // TDT: frames of the next chunk already jumped over
     run: usize,  // TDT: zero-duration tokens in a row on the current frame
 }
 
 impl Decoding {
-    fn new(m: &Model) -> Decoding {
+    fn new(m: &Model, lang: usize) -> Decoding {
         let ctx = vec![0; m.context];
         let n = m.lstm.as_ref().map_or(0, |l| l.hidden);
         let (mut h, mut c) = (vec![0.0; n], vec![0.0; n]);
         if let Some(l) = &m.lstm {  // training runs the LSTM over [blank] + labels: the start state has seen blank
             l.step(&m.dec_emb.row(0), &mut h, &mut c);
         }
-        let out = m.decoder_out(&ctx, &h);
-        Decoding { ctx, out, h, c, skip: 0, run: 0 }
+        let out = m.decoder_out(&ctx, &h, lang);
+        Decoding { ctx, out, h, c, lang, skip: 0, run: 0 }
     }
 }
 
@@ -2062,7 +2098,7 @@ impl<'m> Stream<'m> {
             embed_cache: vec![0.0; 3 * FW * C3],
             states,
             processed: 0,
-            dec: Decoding::new(m),
+            dec: Decoding::new(m, lang),
             finished: false,
             keep_enc: false,
             enc: Vec::new(),

@@ -41,6 +41,7 @@ WER %, second pass (beam 4) / streaming (greedy)
 |  |  | English | 9.97 / 11.04 | 16.26 / 18.06 |
 | `en-km` (60M) | 28.7 MiB | Khmer (CER) | 8.21 / 9.95 | — |
 |  |  | English | 9.41 / 11.69 | 15.02 / 18.93 |
+| `ar` (62M) | 29.9 MiB | Arabic | 5.24 / 6.54 | 7.96 / 9.51 |
 
 ### License
 
