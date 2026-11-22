@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 
 use crate::model::Token;
 
-use crate::session::{CAP, FR, SR, compress, longest_pause};
+use crate::session::{CAP, FR, PAD, SR, close, compress, longest_pause, open_end};
 use crate::text::{W, balance_quotes, cap, end_mark, is_end, show_quotes, spans, trim_trail, units, words};
 use crate::vad::{CHUNK, VadState};
 use crate::{Models, Word, allowed};
@@ -114,9 +114,10 @@ impl Transcription<'_> {
             }
             let end = eou || quiet >= LONG; // the sentence is over: a dot if the model wrote none
             let full = !end && b >= cap_end && b < n; // cut short: more speech may follow
+            let last = !end && b >= n; // the audio ends inside the sentence
             let a = self.open0.saturating_sub(self.ctx);
             let (x, map) = compress(&self.audio[a * FR as usize..b * FR as usize], &self.vf[a..b], a as i64);
-            let (tk, picked) = self.m.full(&x, &self.langs, self.beam);
+            let (tk, picked) = self.m.full(&x, &self.langs, self.beam, false);
             if let Some(l) = picked {
                 self.lang = l;
             }
@@ -131,6 +132,16 @@ impl Transcription<'_> {
                         if !is_end(&last.w) {
                             last.w = format!("{}{}", trim_trail(&last.w), end_mark(&self.m.asr.langs[self.lang]));
                         }
+                    }
+                } else if last && ws.last().is_some_and(|w| open_end(&w.w, &self.m.asr.langs[self.lang])) {
+                    // the audio ends inside the sentence, with no mark or a plain full stop: the end-of-turn head (as
+                    // live, on the turn with at least 0.24 s of silence after it) gives a full stop if the speaker had
+                    // finished, "..." if not
+                    let from = self.open0.max(b.saturating_sub(750));
+                    let mut turn = self.audio[from * FR as usize..b * FR as usize].to_vec();
+                    turn.resize(turn.len() + (PAD as usize - quiet.min(PAD as usize)) * FR as usize, 0.0);
+                    if let (Some(p), Some(w)) = (self.m.eou(&turn, self.lang), ws.last_mut()) {
+                        w.w = close(&w.w, p > 0.5, &self.m.asr.langs[self.lang]);
                     }
                 }
                 (ws.len(), b, 0)

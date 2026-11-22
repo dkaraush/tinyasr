@@ -39,8 +39,11 @@ const char *tinyasr_lang(const tinyasr_models *m, uint32_t i);
  *
  * tinyasr_set_threads(m, n): the library's own n - 1 extra threads (n = 0, 1: none). They start on the first parallel
  *   step, from the thread that makes that call, and inherit its CPU affinity (Linux, Android): pin that thread to the
- *   cores you want and the extra threads follow. Between steps they spin briefly (~0.1 ms), then sleep; tinyasr_free
- *   ends them.
+ *   cores you want and the extra threads follow. Between steps they spin briefly, then sleep: about as long as waking
+ *   takes, measured, on x86-64 and wherever all the cores they may run on share one clock (Linux, Android: e.g.
+ *   pinned to a phone's big cores, below); elsewhere ~tens of us (a phone core that sleeps lets its clock drop).
+ *   Live sessions run the beam search of their re-decodes on the calling thread (its steps are too small to share);
+ *   tinyasr_free ends them.
  * tinyasr_set_parallel_for(m, parallel_for, user, n): your own pool runs the tasks; the library starts no thread.
  *   parallel_for(user, count, task, ctx) must call task(ctx, i) for every i in [0, count) - from any threads, in any
  *   order, possibly at the same time - and return when all have finished. It may be called from any thread, also from
@@ -103,9 +106,11 @@ void tinyasr_set_parallel_for(tinyasr_models *m, tinyasr_parallel_for parallel_f
  * clock: monotonic seconds, or NULL. beam: beam width of the full-context passes (0: the default, 4; 1: greedy,
  * fastest; streaming text is always greedy). push / finish return a JSON array of events:
  *   {"type":"commit","words":[{"text":"Hello,","start":0.52,"end":0.9}, ...]}   final words, appended
- *   {"type":"partial","open":[...],"tail":[...]}   words not final yet (replace the previous partial)
+ *   {"type":"partial","open":[...],"tail":[...]}   words not final yet (replace the previous partial); in a pause the
+ *                                                  end-of-turn head says the speaker goes on after, the last ends "..."
  *   {"type":"language","lang":"uk"}      several languages: the recognizer switched to this one
- *   {"type":"eou","at":3.1,"p":0.93}   the end-of-turn head at a pause (> 0.5: the sentence ends)
+ *   {"type":"eou","at":3.1,"p":0.93}   the end-of-turn head at a pause (> 0.5: the sentence ends); also at finish when
+ *                                      the last sentence is open: <= 0.5, its last word ends "..." (cut off mid-thought)
  */
 /* NULL if m is NULL. */
 tinyasr_session *tinyasr_session_new(const tinyasr_models *m, const char *langs, const char *start_lang,

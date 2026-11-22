@@ -66,14 +66,26 @@ let x = null;
 const models = {};  // file -> tinyasr_models pointer
 const BEAM = 1;  // beam width of the full-context pass (0: the library's default, 4; 1: greedy): greedy, beam 4 is ~20% slower in wasm
 let S = 0, M = 0;
-const mem = () => new Uint8Array(x.memory.buffer);
+// threads (tinyasr-mt.wasm, the page cross-origin isolated): the memory is shared with H helper workers that run the
+// library's steps (its host parallel-for); else one thread and the module's own memory
+let MEM = null, H = 0;
+const ctl = new Int32Array(typeof SharedArrayBuffer === "function" ? new SharedArrayBuffer(64) : new ArrayBuffer(64));  // 0 step, 1 n, 2 next task, 3 helpers done, 4 task, 5 ctx
+const SPIN = 2000;  // checks before sleeping (the next step usually comes within microseconds)
+function parallel_for(n, task, ctx) {
+  ctl[1] = n; ctl[4] = task; ctl[5] = ctx; Atomics.store(ctl, 2, 0); Atomics.store(ctl, 3, 0);
+  Atomics.add(ctl, 0, 1); Atomics.notify(ctl, 0);
+  for (;;) { const i = Atomics.add(ctl, 2, 1); if (i >= n) break; x.tinyasr_web_task(task, ctx, i); }
+  // every helper reports once per step (all of them started before the first): ctx is not used after this returns
+  for (let k = 0; Atomics.load(ctl, 3) < H; k++) if (k > SPIN) Atomics.wait(ctl, 3, Atomics.load(ctl, 3), 1);
+}
+const mem = () => new Uint8Array(MEM.buffer);
 function put(b) { const p = x.tinyasr_alloc(b.length); mem().set(b, p); return [p, b.length]; }
 function cstr(s) { return put(new TextEncoder().encode(s + "\0")); }
 function str(p) { if (!p) return null; const m = mem(); let e = p; while (m[e]) e++; return new TextDecoder().decode(m.slice(p, e)); }
 function free([p, n]) { x.tinyasr_dealloc(p, n); }
 function withPcm(a, f) {
   const p = x.tinyasr_alloc(a.length * 4);
-  new Float32Array(x.memory.buffer, p, a.length).set(a);
+  new Float32Array(MEM.buffer, p, a.length).set(a);
   try { return f(p); } finally { x.tinyasr_dealloc(p, a.length * 4); }
 }
 let vad = null;
@@ -85,6 +97,7 @@ function load(file, buf) {
   free(a); free(v);
   const e = str(err); x.tinyasr_dealloc(err, 256);
   if (!m) throw new Error(e || "could not load " + file);
+  if (H) x.tinyasr_set_parallel_for(m, x.tinyasr_web_parallel_for(), 0, H + 1);
   models[file] = m;
 }
 function stop() {
@@ -97,9 +110,26 @@ onmessage = ev => {
   const m = ev.data;
   try {
     if (m.type === "init") {
-      x = new WebAssembly.Instance(new WebAssembly.Module(m.wasm), { env: { now: () => performance.now() / 1000 } }).exports;
+      const now = () => performance.now() / 1000;
       vad = new Uint8Array(m.vad);
-      postMessage({ type: "ready" });
+      if (m.mt && m.threads > 1 && self.crossOriginIsolated) {
+        MEM = new WebAssembly.Memory({ initial: 1024, maximum: 16384, shared: true });  // the limits of build.sh
+        const mod = new WebAssembly.Module(m.mt);
+        x = new WebAssembly.Instance(mod, { env: { memory: MEM, now, parallel_for } }).exports;
+        // each helper: its own 1 MiB stack (the main thread's size; tasks are shallow) and thread-local storage; ready
+        // once all have started (they take steps only then)
+        const STACK = 1 << 20, want = m.threads - 1, src = URL.createObjectURL(new Blob([m.helper], { type: "text/javascript" }));
+        let up = 0;
+        for (let k = 0; k < want; k++) {
+          const w = new Worker(src), sp = x.tinyasr_alloc(STACK), tls = x.tinyasr_alloc(x.__tls_size.value);
+          w.onmessage = () => { if (++up === want) { H = want; postMessage({ type: "ready", threads: H + 1 }); } };
+          w.postMessage({ mod, memory: MEM, ctl, top: sp + STACK, tls, spin: SPIN });
+        }
+      } else {
+        x = new WebAssembly.Instance(new WebAssembly.Module(m.wasm), { env: { now } }).exports;
+        MEM = x.memory;
+        postMessage({ type: "ready", threads: 1 });
+      }
     } else if (m.type === "model") {
       const t = performance.now();
       load(m.file, m.buf);
@@ -139,6 +169,25 @@ onmessage = ev => {
       postMessage({ type: "filedone", rtf: (performance.now() - t) / 1000 / (m.x.length / 16000), lang });
     }
   } catch (err) { postMessage({ type: "error", text: String(err && err.stack || err) }); }
+};
+</script>
+
+<script id="helper-src" type="text/plain">
+// A helper thread of the recognition worker: the same module on the shared memory, its own stack and thread-local
+// storage; runs its share of every parallel step (see parallel_for there)
+onmessage = ev => {
+  const w = ev.data;
+  const e = new WebAssembly.Instance(w.mod, { env: { memory: w.memory, now: () => performance.now() / 1000, parallel_for: () => { throw new Error("nested parallel step"); } } }).exports;
+  e.__stack_pointer.value = w.top; e.__wasm_init_tls(w.tls);
+  postMessage("up");
+  const ctl = w.ctl; let seen = 0;
+  for (;;) {
+    for (let k = 0; Atomics.load(ctl, 0) === seen; k++) if (k > w.spin) Atomics.wait(ctl, 0, seen);
+    seen = Atomics.load(ctl, 0);
+    const n = ctl[1], task = ctl[4], ctx = ctl[5];
+    for (;;) { const i = Atomics.add(ctl, 2, 1); if (i >= n) break; e.tinyasr_web_task(task, ctx, i); }
+    Atomics.add(ctl, 3, 1); Atomics.notify(ctl, 3);
+  }
 };
 </script>
 
@@ -271,13 +320,19 @@ async function boot() {
   $("model").value = "auto";
   fillLangs();
   lidBoot().catch(err => console.warn("tinylid:", err));
-  const [wasm, vad] = await Promise.all([
-    fetch("tinyasr.wasm").then(r => { if (!r.ok) throw new Error(`tinyasr.wasm: ${r.status}`); return r.arrayBuffer(); }),
+  // threads when the page is cross-origin isolated (here by sw.js): up to 4 (the browser's cores)
+  const threads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 1) : 1;
+  const get = f => fetch(f).then(r => { if (!r.ok) throw new Error(`${f}: ${r.status}`); return r.arrayBuffer(); });
+  // the relaxed-SIMD build where the browser has it (the same results, faster), else the plain one
+  const pick = name => get(name + "-relaxed.wasm").catch(() => null).then(b => b && WebAssembly.validate(b) ? b : get(name + ".wasm"));
+  const [wasm, vad, mt] = await Promise.all([
+    pick("tinyasr"),
     fetchModelFile(BASE + "silero_vad.onnx").then(r => r.arrayBuffer()).then(gunzip),
+    threads > 1 ? pick("tinyasr-mt").catch(() => null) : null,
   ]);
   worker = new Worker(URL.createObjectURL(new Blob([$("worker-src").textContent], { type: "text/javascript" })));
   worker.onmessage = onWorker;
-  worker.postMessage({ type: "init", wasm, vad }, [wasm, vad]);
+  worker.postMessage({ type: "init", wasm, vad, mt, threads, helper: $("helper-src").textContent }, [wasm, vad].concat(mt ? [mt] : []));
 }
 
 // download a model (with progress) and hand it to the worker; resolves once it is loaded there
@@ -338,7 +393,7 @@ function onWorker(ev) {
   const m = ev.data;
   if (m.type === "ready") {
     ready = true; ["mic", "model", "lang", "clear", "file"].forEach(id => $(id).disabled = false);
-    status("Ready. The speech model downloads when you first use it (about 31 MB).");
+    status(`Ready${m.threads > 1 ? ` (${m.threads} threads)` : ""}. The speech model downloads when you first use it (about 31 MB).`);
   } else if (m.type === "loaded") {
     loaded[m.file] = true; $("dl").hidden = true; loading[m.file].done();
   } else if (m.type === "error") {
@@ -656,6 +711,16 @@ $("player").addEventListener("timeupdate", () => {
   if (cur) cur.classList.add("now");
 });
 
+// threads need the page cross-origin isolated (COOP / COEP headers), which a static host (GitHub Pages) can't send:
+// sw.js adds them to every response; the first visit reloads once it controls the page (once: if isolation still
+// fails, e.g. service workers off, the page runs on one thread)
+if (!self.crossOriginIsolated && window.isSecureContext && "serviceWorker" in navigator) {
+  navigator.serviceWorker.register("sw.js").then(() => navigator.serviceWorker.ready).then(() => {
+    let tried = false;
+    try { tried = sessionStorage.getItem("tinyasr.coi") === "1"; sessionStorage.setItem("tinyasr.coi", "1"); } catch {}
+    if (!tried) location.reload();
+  }).catch(err => console.warn("sw.js:", err));
+}
 boot().catch(err => status("Failed to start: " + esc(err.message)));
 </script>
 </body>

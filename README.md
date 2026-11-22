@@ -8,8 +8,8 @@ Demo at: https://dkaraush.github.io/tinyasr/web/
 - RNN-T and TDT transducers, stateless or LSTM-hybrid decoders; greedy or beam search (width 4 by default).
 - Punctuation, capitalization and word timestamps.
 - Live streaming with re-decodes of the open sentence, or a full-context pass over a finished recording.
-- Built-in Silero VAD and end-of-turn head: knows when the speaker has finished a sentence.
-- SIMD on ARM (`i8mm`, `dotprod` or plain NEON, picked at runtime), x86_64 SSE, and WASM; int4 weights stay int4 in memory (~46 MB loaded for a 38 MB model).
+- Built-in Silero VAD and end-of-turn head.
+- SIMD on ARM (`i8mm`, `dotprod`, plain NEON), x86_64 (AVX-512 VNNI, AVX-VNNI or AVX2), and WASM (SIMD128; relaxed SIMD); int4 weights stay int4 in memory (~46 MB loaded for a 38 MB model).
 - Multi-threading supported.
 - Zero dependencies.
 
@@ -34,7 +34,7 @@ WER %, second pass (beam 4) / streaming (greedy)
 |  |  | Spanish | 5.15 / 6.53 | 7.82 / 10.26 |
 |  |  | Italian | 4.90 / 6.33 | 8.64 / 10.97 |
 |  |  | Portuguese | 6.63 / 8.15 | 6.63 / 8.48 |
-| `uz` (64M) | 32.6 MiB | Uzbek (Latin) | 10.06 / 12.95 | 7.05 / 9.32 |
+| [`uz`](#uzbek-kotib) (64M) | 32.6 MiB | Uzbek (Latin) | 10.06 / 12.95 | 7.05 / 9.32 |
 |  |  | Uzbek (Mixed) | 9.69 / 12.67 | 6.81 / 9.24 |
 |  |  | Uzbek (Cyrillic) | 9.95 / 12.86 | 6.93 / 9.36 |
 | `en-fa` (60M) | 28.7 MiB | Persian | 5.87 / 7.23 | 14.29 / 15.98 |
@@ -44,6 +44,11 @@ WER %, second pass (beam 4) / streaming (greedy)
 
 ### License
 
-tinyasr, including the model files in `models/`, is licensed under the [GNU General Public License v3.0 or later](LICENSE).
+tinyasr, including the model files in `models/`, is licensed under the [GNU General Public License v3.0 or later](LICENSE). If you distribute the app with this library or models, either for non-commercial or commercial use, please contribute to open source and release source code of your app.
 
 Models were trained primarily on [YODAS v3](https://huggingface.co/datasets/espnet/yodas3) (ESPnet, [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/)), a corpus of Creative Commons-licensed YouTube audio; see the dataset card for per-source attribution. Voice activity detection uses [Silero VAD](https://github.com/snakers4/silero-vad) (MIT).
+
+### Attribution
+
+<a id="uzbek-kotib"></a>
+- The Uzbek model was trained in collaboration with [kotib.ai](https://kotib.ai/), which contributed to dataset collection and benchmarking.

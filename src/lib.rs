@@ -169,14 +169,14 @@ impl Models {
     }
 
     /// The full-context pass in the one of `langs` the model is most sure of (mean token log-probability): (tokens,
-    /// that language; None if it wrote nothing).
-    fn full(&self, x: &[f32], langs: &[usize], beam: usize) -> (Vec<crate::model::Token>, Option<usize>) {
+    /// that language; None if it wrote nothing). `serial_dec`: as `model::Model::full`.
+    fn full(&self, x: &[f32], langs: &[usize], beam: usize, serial_dec: bool) -> (Vec<crate::model::Token>, Option<usize>) {
         if let [l] = langs {
-            return (self.asr.full(x, *l, beam), Some(*l));
+            return (self.asr.full(x, *l, beam, serial_dec), Some(*l));
         }
         let mut best: Option<(f32, Vec<crate::model::Token>, usize)> = None;
         for &l in langs {
-            let t = self.asr.full(x, l, beam);
+            let t = self.asr.full(x, l, beam, serial_dec);
             let sc = if t.is_empty() { -1e9 } else { t.iter().map(|k| k.logp).sum::<f32>() / t.len() as f32 };
             if best.as_ref().is_none_or(|b| sc > b.0) {
                 best = Some((sc, t, l));

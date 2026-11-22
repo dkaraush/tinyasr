@@ -1,12 +1,12 @@
 //! Live recognition: the logic of the web demo's worker (asr/tinyzipf/web/demo_template.html).
 //!
 //! One streaming pass (320 ms chunks) over all the audio gives the live text; the "open" region (after the last
-//! frozen sentence) is re-decoded with full context at every short pause and every few seconds of new audio, with
-//! left context before it. Speech / silence: Silero VAD. A sentence ends when the model's end-of-turn head says the
-//! speaker has finished (read at 0.24 s of silence, from a second pass over the turn; a "no" again at 0.48 s), after 3 s of
-//! silence anyway, or when the re-decode writes . ? ! and the next sentence has already started; `finish` freezes
-//! everything. Language: one fixed, or with several allowed each re-decode runs in each of them and keeps the one the
-//! model is surest of (the stream follows).
+//! frozen sentence) is re-decoded with full context at every short pause and every 0.32 s of new audio (less often on a
+//! slow device), with left context before it. Speech / silence: Silero VAD. A sentence ends when the model's
+//! end-of-turn head says the speaker has finished (read at 0.24 s of silence, from a second pass over the turn; a "no"
+//! again at 0.48 s), after 3 s of silence anyway, or when the re-decode writes . ? ! and the next sentence has already
+//! started; `finish` freezes everything (the last sentence's end: see `close_last`). Language: one fixed, or with
+//! several allowed each re-decode runs in each of them and keeps the one the model is surest of (the stream follows).
 
 use alloc::format;
 use alloc::string::String;
@@ -28,8 +28,14 @@ pub(crate) const FR: i64 = 640;
 const CTX: i64 = 4 * SR;
 /// Frames of quiet that count as a pause (0.32 s).
 const PAUSE: i64 = 8;
-/// Re-decode at least this often (2.5 s) while there is new audio.
-const REFRESH: i64 = 40000;
+/// Silence the end-of-turn head is asked after (0.24 s).
+pub(crate) const PAD: i64 = 6;
+/// Re-decode at least this often (0.32 s) while there is new audio: the stream's words are often corrected by the
+/// re-decode, so this is how soon the right word shows. A slow device re-decodes less often: the gap after each one is
+/// twice its time (at most ~1/3 of real time).
+const REFRESH: i64 = 5120;
+/// Audio a re-decode must have heard after a sentence end it writes before that sentence is frozen (s).
+const SURE: f64 = 1.5;
 /// Re-decoded length that forces a cut at the longest pause.
 pub(crate) const CAP: i64 = 20 * SR;
 /// Silence after the audio of a full pass (the model writes the last word only once it has heard some).
@@ -70,6 +76,9 @@ pub struct Session<'m> {
     last_shown: String,
     finished: bool,
     ev: Vec<Event>,
+    unfinished: bool, // in a pause the end-of-turn head says the speaker goes on after
+    open_ends: Vec<(f64, String)>, // sentence ends the last re-decode wrote (end s, word)
+    prev_ends: Vec<(f64, String)>, // and the one before it
 }
 
 impl<'m> Session<'m> {
@@ -113,6 +122,9 @@ impl<'m> Session<'m> {
             last_shown: String::new(),
             finished: false,
             ev: Vec::new(),
+            unfinished: false,
+            open_ends: Vec::new(),
+            prev_ends: Vec::new(),
         }
     }
 
@@ -157,6 +169,7 @@ impl<'m> Session<'m> {
         self.finished = true;
         self.stream.finish();
         self.redecode();
+        self.close_last();
         self.commit(true);
         self.stoks.clear();
         self.display();
@@ -260,13 +273,19 @@ impl<'m> Session<'m> {
             tw.drain(..k);
         }
         // the tail's first letter is capitalized as one string (the first word with a letter)
-        let open = self.cap_first(&self.open);
+        let mut open = self.cap_first(&self.open);
         let from = open.last().map_or(self.last_end, |w| w.end as f64); // the tail goes on after the open words
         let mut tail: Vec<Word> = self.out(&tw, tw.iter().map(|w| w.w.clone()), from);
         if self.open.is_empty() && self.ended {
             if let Some(w) = tail.iter_mut().find(|w| w.text.chars().any(|c| c.is_alphanumeric())) {
                 w.text = cap(&w.text);
             }
+        }
+        // a pause the end-of-turn head says the speaker goes on after: "..." on the last word shown (no mark or a
+        // plain full stop) until speech comes back; shown only, never committed
+        let lang = &self.m.asr.langs[self.lang];
+        if let Some(w) = if tail.is_empty() { open.last_mut() } else { tail.last_mut() }.filter(|w| self.unfinished && open_end(&w.text, lang)) {
+            w.text = close(&w.text, false, lang);
         }
         let mut key = String::new();
         for w in open.iter().chain([Word { text: "\0".into(), start: 0.0, end: 0.0, join: false }].iter()).chain(&tail) {
@@ -297,7 +316,8 @@ impl<'m> Session<'m> {
             return;
         }
         let t0 = self.now();
-        let (tk, picked) = self.m.full(&x, &self.langs, self.opt.beam);
+        // the search on this thread: other threads sleep through its small steps (fewer cycles, a few ms later)
+        let (tk, picked) = self.m.full(&x, &self.langs, self.opt.beam, true);
         if let Some(l) = picked.filter(|&l| l != self.lang) {
             // the model picked another language: the stream follows
             self.lang = l;
@@ -324,6 +344,8 @@ impl<'m> Session<'m> {
             keep.extend(open);
             open = keep;
         }
+        let ends = open.iter().filter(|w| is_end(&w.w)).map(|w| (w.te, norm(&w.w))).collect();
+        self.prev_ends = core::mem::replace(&mut self.open_ends, ends);
         self.open = open;
         self.full_at = b * FR;
         self.full_dirty = false;
@@ -361,8 +383,14 @@ impl<'m> Session<'m> {
             return;
         }
         let at = |j: usize| ((ws[j].te + ws[j + 1].t) / 2.0 * SR as f64).round() as i64;
-        // a sentence end that the next sentence has already followed
+        // a sentence end that the next sentence has already followed, once the re-decode heard SURE of audio after it
+        // and the one before wrote it there too (one over a short stretch can end a sentence at a pause that more
+        // audio shows to go on; the open text is on screen either way)
         if let Some(j) = (0..ws.len().saturating_sub(1)).rev().find(|&j| is_end(&ws[j].w)) {
+            let heard = (self.full_at as f64 / SR as f64 - ws[j].te) >= SURE;
+            if !heard || !self.prev_ends.iter().any(|(te, w)| (te - ws[j].te).abs() < 0.12 && *w == norm(&ws[j].w)) {
+                return;
+            }
             let cut = at(j);
             self.freeze(j + 1, cut, SR);
             return;
@@ -389,12 +417,32 @@ impl<'m> Session<'m> {
         let extra: Vec<W> = self.stream_words().into_iter().filter(|w| w.t >= after && w.t >= o0 && w.t < lim).collect();
         self.open.extend(extra);
         self.spoke = false;
+        self.unfinished = false;
         self.turn0 = self.pos;
         let Some(last) = self.open.last_mut() else { return };
         if !is_end(&last.w) {
             last.w = format!("{}{}", trim_trail(&last.w), end_mark(&self.m.asr.langs[self.lang]));
         }
         self.freeze(self.open.len(), self.pos - FR, 0);
+    }
+
+    /// End of audio with the last sentence open: if it ends with no mark or a plain full stop, the end-of-turn head
+    /// (on the turn with at least 0.24 s of silence after it, as it hears a pause) decides: the speaker had finished,
+    /// a full stop (kept, or added); they were cut off mid-thought, "..." (the model writes a full stop on cut-off
+    /// speech too: the audio it decodes ends in silence). ? ! and "..." stay. Without the head the text stays.
+    fn close_last(&mut self) {
+        let lang = &self.m.asr.langs[self.lang];
+        if self.open.last().is_none_or(|w| !open_end(&w.w, lang)) {
+            return;
+        }
+        let from = self.aud0.max(self.turn0).max(self.pos - 30 * SR);
+        let mut turn = self.audio(from, self.pos).to_vec();
+        turn.resize(turn.len() + (PAD - self.quiet.min(PAD)) as usize * FR as usize, 0.0);
+        let Some(p) = self.m.eou(&turn, self.lang) else { return };
+        self.ev.push(Event::Eou { at: self.pos as f32 / SR as f32, p });
+        if let Some(last) = self.open.last_mut() {
+            last.w = close(&last.w, p > 0.5, &self.m.asr.langs[self.lang]);
+        }
     }
 
     /// One 40 ms frame (the last one of the audio may be shorter; it is zero padded).
@@ -420,6 +468,7 @@ impl<'m> Session<'m> {
         if voiced {
             self.spoke = true;
             self.eou = false;
+            self.unfinished = false;
         } else if self.spoke {
             let q = self.quiet + 1;
             self.quiet = q; // end_sentence reads where the pause began
@@ -430,6 +479,8 @@ impl<'m> Session<'m> {
                     self.ev.push(Event::Eou { at: self.pos as f32 / SR as f32, p });
                     if p > 0.5 {
                         self.eou = true;
+                    } else {
+                        self.unfinished = true;
                     }
                 }
             } else if head && q == 12 {
@@ -440,6 +491,7 @@ impl<'m> Session<'m> {
                     if let Some(p) = self.m.eou(self.audio(from, self.pos), self.lang) {
                         self.ev.push(Event::Eou { at: self.pos as f32 / SR as f32, p });
                         end = p > 0.5;
+                        self.unfinished = !end;
                     }
                 }
                 self.eou = false;
@@ -518,4 +570,41 @@ pub(crate) fn longest_pause(ws: &[W]) -> Option<usize> {
         }
     }
     best
+}
+
+/// A last word the end-of-turn head may still close: no . ? ! or a plain full stop (not "..."). Not Khmer: its chat
+/// style has no mark at the end of a message (and no "...").
+pub(crate) fn open_end(w: &str, lang: &crate::model::LangInfo) -> bool {
+    lang.code != "km" && (!is_end(w) || (w.ends_with(end_mark(lang)) && !w.ends_with("...")))
+}
+
+/// The last word of the audio closed: a full stop if the speaker had finished, else "..." (a full stop taken off).
+pub(crate) fn close(w: &str, finished: bool, lang: &crate::model::LangInfo) -> String {
+    let base = trim_trail(w.trim_end_matches(end_mark(lang)));
+    if finished { format!("{base}{}", end_mark(lang)) } else { format!("{base}...") }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::LangInfo;
+
+    /// The end-of-turn rules' marks: no mark or a plain full stop is closed ("..." or the full stop); ? ! "..." stay;
+    /// Khmer is never closed.
+    #[test]
+    fn closing_marks() {
+        let (ru, km) = (LangInfo::new("ru"), LangInfo { full_stop: '។', ..LangInfo::new("km") });
+        for w in ["идея", "идея.", "идея,", "идея;"] {
+            assert!(open_end(w, &ru), "{w}");
+            assert_eq!(close(w, false, &ru), "идея...", "{w}");
+            assert_eq!(close(w, true, &ru), "идея.", "{w}");
+        }
+        for w in ["идея?", "идея!", "идея...", "идея…", "«идея?»"] {
+            assert!(!open_end(w, &ru), "{w}");
+        }
+        for w in ["ទៅ", "ទៅ។"] {
+            assert!(!open_end(w, &km), "{w}");
+        }
+    }
 }

@@ -26,21 +26,95 @@ pub fn block_rows(rows: usize, max: usize) -> usize {
 #[cfg(feature = "std")]
 mod imp {
     use std::cell::RefCell;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
 
-    /// Spins (~tens of us) before sleeping: the next parallel step usually comes sooner, and a sleeping thread takes
-    /// 5-20 us to wake on a phone.
+    /// A thread waiting for the next step (or for the others to finish one) spins a while, then sleeps.
+    ///
+    /// x86-64: as long as waking from sleep takes there, measured as the pool runs (`Shared::wake_ns`): if the step
+    /// comes within that, spinning was the cheaper wait; if not, it cost at most one wake-up more than sleeping at once
+    /// would have (spin-then-block, 2-competitive). On a desktop CPU (64-core Zen 5, 4 threads) that is the same
+    /// speed as a long spin (file pass +2.5%, live latency the same) for a quarter less CPU time.
+    ///
+    /// Elsewhere (phones) the same when every core the threads may run on shares one clock (Linux, Android: one
+    /// cpufreq policy, as when pinned to the big cores of a phone): a Snapdragon 8 Elite, 2 threads on its 2 prime
+    /// cores, live: 14-17% fewer cycles, words as soon. Else a fixed spin of `SPIN` checks (~tens of us): a core that
+    /// sleeps between steps lets its own clock drop (frequency scaling), and the steps it takes next run slower; there
+    /// (4 threads over prime and performance cores) the wake-up-time spin made a file pass 40-60% slower and live words
+    /// 25-60 ms later; waiting in `wfe` instead of spinning made them later too, and used no less battery.
+    /// The first estimate of the wake-up time (ns), before any is measured.
+    const WAKE0: u64 = 20_000;
     const SPIN: u32 = 20_000;
 
-    fn spin_until(mut done: impl FnMut() -> bool) -> bool {
+    /// Spins until done() (timed: for about ns, else `SPIN` checks); whether it is done.
+    fn spin_for(ns: u64, timed: bool, mut done: impl FnMut() -> bool) -> bool {
+        if timed {
+            let t = std::time::Instant::now();
+            loop {
+                for _ in 0..32 {
+                    if done() {
+                        return true;
+                    }
+                    core::hint::spin_loop();
+                }
+                if t.elapsed().as_nanos() as u64 >= ns {
+                    return done();
+                }
+            }
+        }
         for _ in 0..SPIN {
             if done() {
                 return true;
             }
             core::hint::spin_loop();
         }
+        done()
+    }
+
+    /// Whether waits spin for the measured wake-up time (`spin_for`) for threads started from this one: always on
+    /// x86-64; elsewhere when all the cores this thread may run on share one clock.
+    fn timed_spin() -> bool {
+        cfg!(target_arch = "x86_64") || one_clock()
+    }
+
+    /// Linux, Android: the cores this thread may run on (its affinity) all belong to one cpufreq policy. False when
+    /// that cannot be read.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn one_clock() -> bool {
+        let read = |p: &str| std::fs::read_to_string(p).ok();
+        let Some(cpus) = read("/proc/thread-self/status").and_then(|s| s.lines().find_map(|l| l.strip_prefix("Cpus_allowed_list:")).and_then(cpu_list)) else {
+            return false;
+        };
+        let mut first = None;
+        for c in cpus {
+            let Some(policy) = read(&format!("/sys/devices/system/cpu/cpu{c}/cpufreq/related_cpus")).and_then(|s| cpu_list(&s)) else {
+                return false;
+            };
+            if *first.get_or_insert_with(|| policy.clone()) != policy {
+                return false;
+            }
+        }
+        first.is_some()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn one_clock() -> bool {
         false
+    }
+
+    /// A kernel CPU list ("0-5,7", or "6 7" as cpufreq writes it) -> its CPUs; None if malformed.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "android", test)), allow(dead_code))]
+    fn cpu_list(s: &str) -> Option<Vec<usize>> {
+        let mut v = Vec::new();
+        for part in s.split(|c: char| c == ',' || c.is_whitespace()).filter(|p| !p.is_empty()) {
+            let (a, b) = part.split_once('-').unwrap_or((part, part));
+            let (a, b) = (a.trim().parse::<usize>().ok()?, b.trim().parse::<usize>().ok()?);
+            if b < a || b - a > 4096 {
+                return None;
+            }
+            v.extend(a..=b);
+        }
+        Some(v)
     }
 
     /// A host's parallel-for: run task(i) for every i in 0..n, possibly at the same time, and return when all have
@@ -84,6 +158,12 @@ mod imp {
     /// Runs `body` with `exec` as this thread's executor.
     pub fn enter<R>(exec: Option<&Arc<Exec>>, body: impl FnOnce() -> R) -> R {
         let _r = Restore(swap(exec.cloned()));
+        body()
+    }
+
+    /// Runs `body` on this thread alone (its steps are not split).
+    pub fn serial<R>(body: impl FnOnce() -> R) -> R {
+        let _r = Restore(swap(None));
         body()
     }
 
@@ -147,6 +227,12 @@ mod imp {
         // copies of `State::epoch` and `State::active` to spin on (the lock decides)
         epoch: AtomicU64,
         active: AtomicUsize,
+        // when the current job was handed out (ns since t0), and the mean time a sleeping worker took to start on one
+        t0: std::time::Instant,
+        posted: AtomicU64,
+        wake_ns: AtomicU64,
+        // waits spin for wake_ns (`timed_spin`, decided when the workers start)
+        timed: AtomicBool,
     }
 
     #[derive(Default)]
@@ -180,6 +266,10 @@ mod imp {
                     done: Condvar::new(),
                     epoch: AtomicU64::new(0),
                     active: AtomicUsize::new(0),
+                    t0: std::time::Instant::now(),
+                    posted: AtomicU64::new(0),
+                    wake_ns: AtomicU64::new(WAKE0),
+                    timed: AtomicBool::new(cfg!(target_arch = "x86_64")),
                 }),
                 workers: Mutex::new(Vec::new()),
                 busy: Mutex::new(()),
@@ -206,6 +296,7 @@ mod imp {
             {
                 let mut st = self.lock();
                 st.job = Some(Job { f, next: &next, n });
+                self.sh.posted.store(self.sh.t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 st.epoch += 1;
                 st.panicked = false;
                 self.sh.epoch.store(st.epoch, Ordering::Release);
@@ -218,7 +309,8 @@ mod imp {
                     st.job = None;
                     if st.active > 0 {
                         drop(st);
-                        spin_until(|| self.0.sh.active.load(Ordering::Acquire) == 0);
+                        let sh = &self.0.sh;
+                        spin_for(sh.wake_ns.load(Ordering::Relaxed), sh.timed.load(Ordering::Relaxed), || sh.active.load(Ordering::Acquire) == 0);
                         st = self.0.lock();
                     }
                     while st.active > 0 {
@@ -243,6 +335,10 @@ mod imp {
         /// The workers, spawned from the calling thread (they inherit its CPU affinity).
         fn start(&self) {
             let mut w = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+            if w.is_empty() && self.threads > 1 {
+                // the workers inherit this thread's affinity: where they may run decides how they wait
+                self.sh.timed.store(timed_spin(), Ordering::Relaxed);
+            }
             while w.len() + 1 < self.threads {
                 let sh = self.sh.clone();
                 match std::thread::Builder::new().name("tinyasr".into()).spawn(move || worker(&sh)) {
@@ -257,9 +353,10 @@ mod imp {
     fn worker(sh: &Shared) {
         let mut seen = 0;
         loop {
-            spin_until(|| sh.epoch.load(Ordering::Acquire) != seen);
+            spin_for(sh.wake_ns.load(Ordering::Relaxed), sh.timed.load(Ordering::Relaxed), || sh.epoch.load(Ordering::Acquire) != seen);
             let job = {
                 let mut st = sh.st.lock().unwrap_or_else(|e| e.into_inner());
+                let mut slept = false;
                 loop {
                     if st.quit {
                         return;
@@ -268,9 +365,16 @@ mod imp {
                         seen = st.epoch;
                         st.active += 1;
                         sh.active.store(st.active, Ordering::Release);
+                        if slept {
+                            // how long this wake-up took (from the job's hand-out): the mean of the recent ones
+                            let ns = (sh.t0.elapsed().as_nanos() as u64).saturating_sub(sh.posted.load(Ordering::Relaxed)).min(1_000_000);
+                            let old = sh.wake_ns.load(Ordering::Relaxed);
+                            sh.wake_ns.store((7 * old + ns) / 8, Ordering::Relaxed);
+                        }
                         break j;
                     }
                     st = sh.wake.wait(st).unwrap_or_else(|e| e.into_inner());
+                    slept = true;
                 }
             };
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -307,6 +411,18 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn cpu_lists() {
+            assert_eq!(cpu_list("0-5,7\n"), Some(vec![0, 1, 2, 3, 4, 5, 7]));
+            assert_eq!(cpu_list("6 7\n"), Some(vec![6, 7]));
+            assert_eq!(cpu_list("6,7"), Some(vec![6, 7]));
+            assert_eq!(cpu_list(""), Some(vec![]));
+            assert_eq!(cpu_list("3-1"), None);
+            assert_eq!(cpu_list("x"), None);
+            // whatever this machine says, asking never fails
+            let _ = timed_spin();
+        }
 
         #[test]
         fn pool_runs_every_task_once() {
@@ -360,6 +476,10 @@ mod imp {
 
     pub fn threads() -> usize {
         1
+    }
+
+    pub fn serial<R>(body: impl FnOnce() -> R) -> R {
+        body()
     }
 
     pub fn chunks_mut<T>(out: &mut [T], len: usize, _work: usize, f: impl Fn(usize, &mut [T])) {

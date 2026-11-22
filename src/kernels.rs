@@ -11,10 +11,13 @@ use crate::compat::F32Ext;
 // (4x16 = 16 accumulators); wasm SIMD / x86-64 SSE have 16 (2x16 = 8).
 const NR: usize = 16; // output columns per panel
 #[cfg(target_arch = "aarch64")]
-const MR: usize = 4; // output rows per micro-kernel call
+const MR: usize = 6; // output rows per micro-kernel call
 #[cfg(not(target_arch = "aarch64"))]
-const MR: usize = 2;
+const MR: usize = 6;
 const MB: usize = 64; // rows per cache block
+/// Rows up to which x86-64 multiplies integer weights widened in registers (more: widened once per cache block).
+#[cfg(target_arch = "x86_64")]
+const SMALL: usize = 16;
 
 /// Right-hand matrix packed into panels of NR output columns, k-major inside a panel, so the
 /// micro-kernel reads NR contiguous weights per k step (outer-product form, no reductions).
@@ -51,6 +54,12 @@ pub fn gemm(a: &[f32], m: usize, b: &Packed, bias: Option<&[f32]>) -> Vec<f32> {
     out
 }
 
+/// `gemm` into out (m x n, written whole).
+pub fn gemm_into(a: &[f32], m: usize, b: &Packed, bias: Option<&[f32]>, out: &mut [f32]) {
+    assert!(a.len() >= m * b.k && out.len() == m * b.n);
+    gemm_rows(&a[..m * b.k], b, bias, out);
+}
+
 fn gemm_rows(a: &[f32], b: &Packed, bias: Option<&[f32]>, out: &mut [f32]) {
     blocked(a, b, bias, out);
 }
@@ -84,7 +93,6 @@ fn blocked(a: &[f32], b: &(impl Panels + Sync), bias: Option<&[f32]>, out: &mut 
     crate::par::chunks_mut(out, mb * n, m * n * k, |blk, out| {
         let i0 = blk * mb;
         let i1 = (i0 + mb).min(m);
-        let mut tile = [[0f32; NR]; MR];
         let mut scratch = vec![0f32; k * NR];
         for jp in 0..n.div_ceil(NR) {
             let panel = b.panel(jp, &mut scratch);
@@ -94,26 +102,44 @@ fn blocked(a: &[f32], b: &(impl Panels + Sync), bias: Option<&[f32]>, out: &mut 
             if let Some(bias) = bias {
                 init[..cols].copy_from_slice(&bias[j0..j0 + cols]);
             }
-            let mut i = i0;
-            while i < i1 {
-                let rows = MR.min(i1 - i);
-                if rows == MR {
-                    kernel::<MR>(&a[i * k..(i + MR) * k], k, panel, &init, &mut tile);
-                } else {
-                    for r in 0..rows {
-                        let mut one = [[0f32; NR]; 1];
-                        kernel::<1>(&a[(i + r) * k..(i + r + 1) * k], k, panel, &init, &mut one);
-                        tile[r] = one[0];
-                    }
-                }
-                for r in 0..rows {
-                    let o = (i + r - i0) * n + j0;
-                    out[o..o + cols].copy_from_slice(&tile[r][..cols]);
-                }
-                i += rows;
+            let o = &mut out[j0..];
+            #[cfg(target_arch = "x86_64")]
+            #[allow(unsafe_code)]
+            // SAFETY: the level was detected on this CPU (`x86`)
+            match x86() {
+                X86::Avx512 => unsafe { x86::rows_avx512(&a[i0 * k..i1 * k], k, panel, &init, o, n, cols) },
+                X86::Avx2 => unsafe { x86::rows_avx2(&a[i0 * k..i1 * k], k, panel, &init, o, n, cols) },
+                X86::Sse2 => rows(&a[i0 * k..i1 * k], k, panel, &init, o, n, cols),
             }
+            #[cfg(not(target_arch = "x86_64"))]
+            rows(&a[i0 * k..i1 * k], k, panel, &init, o, n, cols);
         }
     });
+}
+
+/// Rows of `a` (k each) x one panel into the first `cols` columns of `out` (row r at r * stride), MR rows per
+/// micro-kernel call.
+#[inline(always)]
+fn rows(a: &[f32], k: usize, panel: &[f32], init: &[f32; NR], out: &mut [f32], stride: usize, cols: usize) {
+    let m = a.len() / k;
+    let mut tile = [[0f32; NR]; MR];
+    let mut i = 0;
+    while i < m {
+        let rows = MR.min(m - i);
+        if rows == MR {
+            kernel::<MR>(&a[i * k..(i + MR) * k], k, panel, init, &mut tile);
+        } else {
+            for r in 0..rows {
+                let mut one = [[0f32; NR]; 1];
+                kernel::<1>(&a[(i + r) * k..(i + r + 1) * k], k, panel, init, &mut one);
+                tile[r] = one[0];
+            }
+        }
+        for r in 0..rows {
+            out[(i + r) * stride..(i + r) * stride + cols].copy_from_slice(&tile[r][..cols]);
+        }
+        i += rows;
+    }
 }
 
 /// out = init + rows(a) x panel, for R rows of `a` (each k long) and one panel of NR columns.
@@ -196,10 +222,20 @@ fn kernel<const R: usize>(a: &[f32], k: usize, panel: &[f32], init: &[f32; NR], 
 #[allow(clippy::approx_constant)] // polynomial coefficients, not ln 2
 pub fn exp(x: f32) -> f32 {
     let t = (x * core::f32::consts::LOG2_E).clamp(-126.0, 126.0);
+    #[cfg(not(target_arch = "x86_64"))]
     let i = t.floor();
+    // floor without SSE4.1 (a libm call): t rounded to an integer by adding and taking away 1.5 * 2^23 (exact for
+    // |t| < 2^22), one less if that rounded up; the same bits (for t = -0, f below is the same 0)
+    #[cfg(target_arch = "x86_64")]
+    let i = {
+        let r = (t + 12_582_912.0) - 12_582_912.0;
+        if r > t { r - 1.0 } else { r }
+    };
     let f = t - i;
     let p = 1.0 + f * (0.693_147_2 + f * (0.240_226_5 + f * (0.055_504_11 + f * (0.009_618_129 + f * 0.001_333_355))));
-    f32::from_bits(((i as i32 + 127) as u32) << 23) * p
+    // 2^i: the biased exponent i + 127 (an integer in 1..=253) read off the mantissa of i + 127 + 2^23, which is exact;
+    // the same bits as `(i as i32 + 127) << 23`, but a saturating float -> int cast does not vectorize
+    f32::from_bits(((i + 127.0 + 8_388_608.0).to_bits() - 0x4b00_0000) << 23) * p
 }
 
 /// ln for x > 0 (normal): x = m 2^e with m in [sqrt(1/2), sqrt 2), ln m = 2 atanh(s), s = (m - 1) / (m + 1), as an odd
@@ -261,6 +297,45 @@ pub fn swoosh4(x: &mut [f32], shift: f32, c: f32) {
     }
 }
 
+/// Runs `f` (inlined) with this CPU's vector extensions on, so the loops in it that LLVM vectorizes use them (x86-64:
+/// AVX2 / AVX-512, detected at run time). The same operations per value: the same bits.
+#[inline(always)]
+pub fn vector<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(target_arch = "x86_64")]
+    {
+        #[target_feature(enable = "avx2,fma")]
+        fn avx2<R>(f: impl FnOnce() -> R) -> R {
+            f()
+        }
+        #[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vl,avx2,fma")]
+        fn avx512<R>(f: impl FnOnce() -> R) -> R {
+            f()
+        }
+        #[allow(unsafe_code)]
+        // SAFETY: the level was detected on this CPU (`x86`).
+        match x86() {
+            X86::Avx512 => return unsafe { avx512(f) },
+            X86::Avx2 => return unsafe { avx2(f) },
+            X86::Sse2 => {}
+        }
+    }
+    f()
+}
+
+/// x = f(x) for every value, vectorized (`vector`).
+#[inline(always)]
+pub fn map(x: &mut [f32], f: impl Fn(f32) -> f32) {
+    vector(#[inline(always)] || x.iter_mut().for_each(|v| *v = f(*v)));
+}
+
+/// log(sum(e^v)) of v with its maximum m (the exponentials vectorized, summed in order).
+#[inline(always)]
+pub fn log_sum_exp(v: &[f32], m: f32) -> f32 {
+    let mut e = vec![0f32; v.len()];
+    vector(#[inline(always)] || e.iter_mut().zip(v).for_each(|(e, x)| *e = exp(x - m)));
+    m + e.iter().sum::<f32>().ln()
+}
+
 #[inline(always)]
 pub fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + exp(-x))
@@ -309,6 +384,8 @@ pub enum Path {
     Mmla,
     /// wasm SIMD128: widening multiplies (`i16x8.extmul_*_i8x16_s`).
     Wasm,
+    /// x86-64 AVX2 (`vpmaddubsw`), AVX-VNNI or AVX-512 VNNI (`vpdpbusd`): `IntX86`.
+    X86,
 }
 
 /// Row pairs per kernel call at most (i8mm: 4, the others 2).
@@ -354,7 +431,7 @@ pub fn path() -> Path {
         static P: AtomicU8 = AtomicU8::new(0);
         let v = P.load(Ordering::Relaxed);
         if v != 0 {
-            return [Path::F32, Path::Scalar, Path::Neon, Path::Dot, Path::Mmla, Path::Wasm][v as usize - 1];
+            return [Path::F32, Path::Scalar, Path::Neon, Path::Dot, Path::Mmla, Path::Wasm, Path::X86][v as usize - 1];
         }
         let (mmla, dot) = cpu_features();
         let p = if mmla && dot {
@@ -369,14 +446,26 @@ pub fn path() -> Path {
     }
     #[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
     {
-        // the same integer arithmetic, portable (to check accuracy off-device): TINYASR_INT8=1
+        // the integer arithmetic of the ARM kernels: x86-64 with AVX2 by default (its own kernels, the same results),
+        // TINYASR_INT8=scalar (portable); TINYASR_INT8=0 or no AVX2: f32
         #[cfg(feature = "std")]
         {
             static P: std::sync::OnceLock<Path> = std::sync::OnceLock::new();
-            *P.get_or_init(|| if std::env::var("TINYASR_INT8").is_ok_and(|v| v == "1") { Path::Scalar } else { Path::F32 })
+            *P.get_or_init(|| match std::env::var("TINYASR_INT8").as_deref() {
+                Ok("0") => Path::F32,
+                Ok("scalar") => Path::Scalar,
+                #[cfg(target_arch = "x86_64")]
+                _ if x86() >= X86::Avx2 => Path::X86,
+                Ok("1") => Path::Scalar,
+                _ => Path::F32,
+            })
         }
         #[cfg(not(feature = "std"))]
         {
+            #[cfg(target_arch = "x86_64")]
+            if x86() >= X86::Avx2 {
+                return Path::X86;
+            }
             Path::F32
         }
     }
@@ -534,7 +623,17 @@ impl Quant {
         let path = path();
         let mut out = vec![0.0; m * self.n];
         if path == Path::F32 {
+            #[cfg(target_arch = "x86_64")]
+            if m <= SMALL && x86() >= X86::Avx2 {
+                self.gemm_small(a, m, bias, &mut out);
+                return out;
+            }
             blocked(a, self, bias, &mut out);
+            return out;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if path == Path::X86 {
+            self.gemm_x86(a, m, bias, &mut out);
             return out;
         }
         match self.lay {
@@ -587,6 +686,85 @@ impl Quant {
             self.block(path, &act, p0, (p0 + mbp).min(pairs), m, 0, np, bias, out, r0, 0, n);
         });
         out
+    }
+
+    /// The f32 product for few rows, the weights widened in registers (x86-64 AVX2 / AVX-512): groups of output panels,
+    /// one task each, into their own columns. The same bits as `blocked`.
+    #[cfg(target_arch = "x86_64")]
+    fn gemm_small(&self, a: &[f32], m: usize, bias: Option<&[f32]>, out: &mut [f32]) {
+        let (n, k) = (self.n, self.k);
+        let np = n.div_ceil(8);
+        // bias per output, padded to whole pairs of panels
+        let mut init = vec![0f32; np.div_ceil(2) * 16];
+        if let Some(b) = bias {
+            init[..n].copy_from_slice(&b[..n]);
+        }
+        const PG: usize = 8; // panels per task (even)
+        let lvl = x86();
+        let cols = crate::par::map(np.div_ceil(PG), m * n * k, |grp| {
+            let (jp0, jp1) = (grp * PG, (grp * PG + PG).min(np));
+            let w = (jp1 - jp0).div_ceil(2) * 16;
+            let mut o = vec![0f32; m * w];
+            #[allow(unsafe_code)]
+            // SAFETY: the level was detected on this CPU (`x86`).
+            unsafe {
+                if lvl == X86::Avx512 {
+                    x86::quant_avx512(self, a, m, &init, jp0, jp1, &mut o, w)
+                } else {
+                    x86::quant_avx2(self, a, m, &init, jp0, jp1, &mut o, w)
+                }
+            }
+            o
+        });
+        for (grp, o) in cols.iter().enumerate() {
+            let j0 = grp * PG * 8;
+            let w = o.len() / m;
+            let c = w.min(n - j0);
+            for r in 0..m {
+                out[r * n + j0..r * n + j0 + c].copy_from_slice(&o[r * w..r * w + c]);
+            }
+        }
+    }
+
+    /// The integer product on x86-64 (`IntX86`): blocks of rows (each quantizes its own), or for few rows groups of
+    /// output panels, one task each. The results of `tile_scalar` (exact integer sums, then the same float steps).
+    #[cfg(target_arch = "x86_64")]
+    fn gemm_x86(&self, a: &[f32], m: usize, bias: Option<&[f32]>, out: &mut [f32]) {
+        let (n, k, g) = (self.n, self.k, self.group);
+        let np = n.div_ceil(8);
+        let mut init = vec![0f32; np * 8];
+        if let Some(b) = bias {
+            init[..n].copy_from_slice(&b[..n]);
+        }
+        let work = m * n * k;
+        let kern = int_x86();
+        const MBX: usize = 32; // rows per cache block
+        let mb = crate::par::block_rows(m, MBX);
+        let threads = crate::par::threads();
+        if threads > 1 && m.div_ceil(mb) < 2 * threads && np >= 2 * threads && work >= crate::par::MIN_WORK {
+            let act = ActX::new(a, m, k, g);
+            let pg = np.div_ceil(4 * threads);
+            assert!(out.len() >= m * n);
+            // every task writes its own columns of out
+            struct Out(*mut f32);
+            // SAFETY: the tasks write disjoint columns, and out outlives them (`map` returns when all are done).
+            #[allow(unsafe_code)]
+            unsafe impl Sync for Out {}
+            let o = Out(out.as_mut_ptr());
+            crate::par::map(np.div_ceil(pg), work, |grp| {
+                let (jp0, jp1) = (grp * pg, (grp * pg + pg).min(np));
+                let o = &o;
+                // SAFETY: columns jp0 * 8.. (up to n) of the m rows of out (asserted), this task's alone.
+                #[allow(unsafe_code)]
+                unsafe { x86::int_raw(kern, self, &act, &init, jp0, jp1, ((jp1 - jp0) * 8).min(n - jp0 * 8), o.0.add(jp0 * 8), n) }
+            });
+            return;
+        }
+        crate::par::chunks_mut(out, mb * n, work, |blk, out| {
+            let (r0, rows) = (blk * mb, out.len() / n);
+            let act = ActX::new(&a[r0 * k..(r0 + rows) * k], rows, k, g);
+            x86::int(kern, self, &act, &init, 0, np, n, out, n);
+        });
     }
 
     /// Row pairs p0..p1 x output panels jp0..jp1 into `out` (row r, column j at (r - r0) * stride + j - c0). `act`
@@ -806,11 +984,20 @@ fn pack_rows(a: &[f32], m: usize, k: usize, g: usize) -> (Vec<i8>, Vec<f32>) {
 
 #[inline(always)]
 fn absmax(x: &[f32]) -> f32 {
-    // 8 independent lanes so the reduction vectorizes (max is exact in any order)
-    let mut m = [0f32; 8];
-    for c in x.chunks_exact(8) {
+    // 16 independent lanes so the reduction vectorizes (max is exact in any order); `v > m` skips NaN as `max` does,
+    // and is one instruction
+    let mut m = [0f32; 16];
+    let mut it = x.chunks_exact(16);
+    for c in &mut it {
+        for l in 0..16 {
+            let v = c[l].abs();
+            m[l] = if v > m[l] { v } else { m[l] };
+        }
+    }
+    for c in it.remainder().chunks_exact(8) {
         for l in 0..8 {
-            m[l] = m[l].max(c[l].abs());
+            let v = c[l].abs();
+            m[l] = if v > m[l] { v } else { m[l] };
         }
     }
     m.iter().fold(0f32, |a, &b| a.max(b))
@@ -1168,6 +1355,37 @@ mod wasm {
         i64x2_shuffle::<1, 0>(v, v)
     }
 
+    /// int4 on relaxed SIMD: `i32x4.relaxed_dot_i8x16_i7x16_add_s` (sdot / pmaddubsw-like). Its second operand is
+    /// exact on every engine only with the top bit clear (0..=127), so the weights go in + 8 (0..=15) and 8 x the sum
+    /// of the activations comes off (`sum`). d = [r0 o0, r0 o0, r1 o1, r1 o1] (a: [row 0 | row 1] x w: [output 0 |
+    /// output 1], 4-k halves), x = the same with the rows swapped: [r1 o0, r1 o0, r0 o1, r0 o1].
+    #[cfg(target_feature = "relaxed-simd")]
+    #[derive(Clone, Copy)]
+    struct Dot(v128, v128);
+
+    #[cfg(target_feature = "relaxed-simd")]
+    impl Dot {
+        #[inline(always)]
+        fn zero() -> Dot {
+            Dot(i32x4_splat(0), i32x4_splat(0))
+        }
+        #[inline(always)]
+        fn mac(&mut self, a: v128, x: v128, w: v128) {
+            self.0 = i32x4_relaxed_dot_i8x16_i7x16_add(a, w, self.0);
+            self.1 = i32x4_relaxed_dot_i8x16_i7x16_add(x, w, self.1);
+        }
+        /// [r0 o0, r0 o1, r1 o0, r1 o1] (MMLA_LANES), x 16: the sums with the weights x 16 as `Blk` makes them. sa:
+        /// the activations' sums [r0, r0, r1, r1] (4-k halves), the same dot with ones.
+        #[inline(always)]
+        fn sum(&self, sa: v128) -> v128 {
+            let (d, x) = (i32x4_sub(self.0, i32x4_shl(sa, 3)), i32x4_sub(self.1, i32x4_shl(swap(sa), 3)));
+            let e = i32x4_shuffle::<0, 2, 4, 6>(d, x); // r0o0 r1o1 r1o0 r0o1 (first halves)
+            let o = i32x4_shuffle::<1, 3, 5, 7>(d, x);
+            let s = i32x4_add(e, o);
+            i32x4_shl(i32x4_shuffle::<0, 3, 2, 1>(s, s), 4)
+        }
+    }
+
     /// wasm SIMD128 kernel: one row pair x two output pairs (8 accumulators: x86, which runs most wasm, has 16 vector
     /// registers), 16 k per iteration.
     pub unsafe fn tile<const RP: usize, const INT4: bool>(a: *const i8, sa: *const f32, w: *const u8, sw: *const f32, k: usize, g: usize, t: &mut [[[f32; 4]; 4]; super::RPMAX]) {
@@ -1181,6 +1399,30 @@ mod wasm {
                     let w = w.add(32 * half);
                     let (mut f0, mut f1) = (f32x4_splat(0.0), f32x4_splat(0.0));
                     for c in 0..ng {
+                        #[cfg(target_feature = "relaxed-simd")]
+                        if INT4 {
+                            let (mut d0, mut d1, mut asum) = (Dot::zero(), Dot::zero(), i32x4_splat(0));
+                            let (m0f, m08, one) = (i8x16_splat(0x0f), i8x16_splat(8), i8x16_splat(1));
+                            let mut kk = c * g;
+                            while kk < (c + 1) * g {
+                                let (a0, a1) = (v128_load(a.add(kk * 2) as *const v128), v128_load(a.add(kk * 2 + 16) as *const v128));
+                                let (x0, x1) = (swap(a0), swap(a1));
+                                asum = i32x4_relaxed_dot_i8x16_i7x16_add(a1, one, i32x4_relaxed_dot_i8x16_i7x16_add(a0, one, asum));
+                                let (v0, v1) = (v128_load(w.add(kk * 4) as *const v128), v128_load(w.add(kk * 4 + 16) as *const v128));
+                                // low nibbles (k .. k + 8), high nibbles (k + 8 .. k + 16): two's complement + 8
+                                d0.mac(a0, x0, v128_xor(v128_and(v0, m0f), m08));
+                                d0.mac(a1, x1, v128_xor(u8x16_shr(v0, 4), m08));
+                                d1.mac(a0, x0, v128_xor(v128_and(v1, m0f), m08));
+                                d1.mac(a1, x1, v128_xor(u8x16_shr(v1, 4), m08));
+                                kk += 16;
+                            }
+                            let sav = v128_load(sa.add(c * 4) as *const v128);
+                            let s0 = f32x4_mul(sav, v128_load64_splat(sw.add(c * 8 + 4 * half) as *const u64));
+                            let s1 = f32x4_mul(sav, v128_load64_splat(sw.add(c * 8 + 4 * half + 2) as *const u64));
+                            f0 = f32x4_add(f0, f32x4_mul(f32x4_convert_i32x4(d0.sum(asum)), s0));
+                            f1 = f32x4_add(f1, f32x4_mul(f32x4_convert_i32x4(d1.sum(asum)), s1));
+                            continue;
+                        }
                         let (mut b0, mut b1) = (Blk::zero(), Blk::zero());
                         let mut kk = c * g;
                         while kk < (c + 1) * g {
@@ -1219,19 +1461,77 @@ impl Panels for Quant {
         self.k
     }
     fn panel<'s>(&'s self, jp: usize, scratch: &'s mut [f32]) -> &'s [f32] {
-        let (n, k) = (self.n, self.k);
-        let j0 = jp * NR;
-        let cols = NR.min(n - j0);
-        if cols < NR {
-            scratch.fill(0.0);
-        }
-        for l in 0..cols {
-            for p in 0..k {
-                let (q, s) = self.at(j0 + l, p);
-                scratch[p * NR + l] = q as f32 * s;
+        const { assert!(NR == 16) };
+        let (k, g) = (self.k, self.group);
+        if self.lay != Lay::Pair {
+            // another layout (met here only when the path is forced to f32, and in tests): weight by weight
+            let j0 = jp * NR;
+            let cols = NR.min(self.n - j0);
+            if cols < NR {
+                scratch.fill(0.0);
             }
+            for l in 0..cols {
+                for p in 0..k {
+                    let (q, s) = self.at(j0 + l, p);
+                    scratch[p * NR + l] = q as f32 * s;
+                }
+            }
+            return scratch;
+        }
+        let (ng, pb) = (k / g, self.panel_bytes());
+        // f32 panel jp (16 columns) = integer panels 2jp, 2jp + 1 (8 outputs each); a missing second one is zeros
+        for h in 0..2 {
+            let jq = 2 * jp + h;
+            if jq >= self.n.div_ceil(8) {
+                scratch[..k * NR].chunks_exact_mut(NR).for_each(|r| r[8..].fill(0.0));
+                continue;
+            }
+            widen8(self.int4, &self.w[jq * pb..(jq + 1) * pb], &self.s[jq * ng * 8..(jq + 1) * ng * 8], k, g, &mut scratch[..k * NR], 8 * h);
         }
         scratch
+    }
+}
+
+/// One integer panel (8 outputs) widened to f32 (q * scale, as the integer kernels see them) into columns c0..c0 + 8
+/// of a k x NR panel.
+#[inline(always)]
+fn widen8(int4: bool, w: &[u8], s: &[f32], k: usize, g: usize, out: &mut [f32], c0: usize) {
+    assert!(w.len() >= k * if int4 { 4 } else { 8 } && s.len() >= k / g * 8 && out.len() >= k * NR && c0 + 8 <= NR);
+    #[cfg(target_arch = "x86_64")]
+    if x86() >= X86::Avx2 {
+        #[allow(unsafe_code)]
+        // SAFETY: AVX2 detected (`x86`); the slices hold what was asserted above.
+        unsafe { x86::widen8(int4, w, s, k, g, out, c0) };
+        return;
+    }
+    widen8_plain(int4, w, s, k, g, out, c0);
+}
+
+#[inline(always)]
+fn widen8_plain(int4: bool, w: &[u8], s: &[f32], k: usize, g: usize, out: &mut [f32], c0: usize) {
+    // per block of 64 bytes: 8 (int8) or 16 (int4) k-steps of the 8 outputs
+    let ks = if int4 { 16 } else { 8 };
+    for (b, blk) in w[..k / ks * 64].chunks_exact(64).enumerate() {
+        let k0 = b * ks;
+        let sc: &[f32; 8] = s[k0 / g * 8..k0 / g * 8 + 8].try_into().unwrap();
+        for i in 0..8 {
+            let byte = |o: usize| blk[(o / 2) * 16 + (o % 2) * 8 + i];
+            if int4 {
+                let lo = &mut out[(k0 + i) * NR + c0..(k0 + i) * NR + c0 + 8];
+                for o in 0..8 {
+                    lo[o] = ((byte(o) << 4) as i8) as f32 * sc[o];
+                }
+                let hi = &mut out[(k0 + 8 + i) * NR + c0..(k0 + 8 + i) * NR + c0 + 8];
+                for o in 0..8 {
+                    hi[o] = ((byte(o) & 0xf0) as i8) as f32 * sc[o];
+                }
+            } else {
+                let r = &mut out[(k0 + i) * NR + c0..(k0 + i) * NR + c0 + 8];
+                for o in 0..8 {
+                    r[o] = (byte(o) as i8) as f32 * sc[o];
+                }
+            }
+        }
     }
 }
 
@@ -1273,33 +1573,26 @@ impl QuantF {
                 let (jp0, jp1) = (grp * PG, (grp * PG + PG).min(np));
                 let w = (jp1 - jp0) * NR;
                 let mut o = vec![0f32; m * w];
-                for jp in jp0..jp1 {
-                    let j0 = jp * NR;
-                    let cols = NR.min(n - j0);
-                    let mut init = [0f32; NR];
-                    if let Some(b) = bias {
-                        init[..cols].copy_from_slice(&b[j0..j0 + cols]);
+                #[cfg(target_arch = "x86_64")]
+                {
+                    #[target_feature(enable = "avx2,fma")]
+                    fn avx2(q: &QuantF, a: &[f32], m: usize, bias: Option<&[f32]>, jp0: usize, jp1: usize, o: &mut [f32]) {
+                        q.panels_small(a, m, bias, jp0, jp1, o)
                     }
-                    let panel = &self.q[jp * k * NR..(jp + 1) * k * NR];
-                    let sc: &[f32; NR] = self.s[j0..j0 + NR].try_into().unwrap();
-                    let mut i = 0;
-                    while i < m {
-                        let rows = 4.min(m - i);
-                        let mut tile = [[0f32; NR]; 4];
-                        let a = &a[i * k..(i + rows) * k];
-                        match rows {
-                            4 => kernel_q8::<4>(a, k, panel, sc, &init, &mut tile),
-                            3 => kernel_q8::<3>(a, k, panel, sc, &init, (&mut tile[..3]).try_into().unwrap()),
-                            2 => kernel_q8::<2>(a, k, panel, sc, &init, (&mut tile[..2]).try_into().unwrap()),
-                            _ => kernel_q8::<1>(a, k, panel, sc, &init, (&mut tile[..1]).try_into().unwrap()),
-                        }
-                        for r in 0..rows {
-                            let o0 = (i + r) * w + (jp - jp0) * NR;
-                            o[o0..o0 + NR].copy_from_slice(&tile[r]);
-                        }
-                        i += rows;
+                    #[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vl,avx2,fma")]
+                    fn avx512(q: &QuantF, a: &[f32], m: usize, bias: Option<&[f32]>, jp0: usize, jp1: usize, o: &mut [f32]) {
+                        q.panels_small(a, m, bias, jp0, jp1, o)
+                    }
+                    #[allow(unsafe_code)]
+                    // SAFETY: the level was detected on this CPU (`x86`).
+                    match x86() {
+                        X86::Avx512 => unsafe { avx512(self, a, m, bias, jp0, jp1, &mut o) },
+                        X86::Avx2 => unsafe { avx2(self, a, m, bias, jp0, jp1, &mut o) },
+                        X86::Sse2 => self.panels_small(a, m, bias, jp0, jp1, &mut o),
                     }
                 }
+                #[cfg(not(target_arch = "x86_64"))]
+                self.panels_small(a, m, bias, jp0, jp1, &mut o);
                 o
             });
             for (grp, o) in cols.iter().enumerate() {
@@ -1382,6 +1675,76 @@ fn kernel_q8<const R: usize>(a: &[f32], k: usize, panel: &[i8], sc: &[f32; NR], 
     }
 }
 
+impl QuantF {
+    /// Panels jp0..jp1 of m (<= 8) rows into o (m x (jp1 - jp0) * NR), weights widened in registers.
+    #[inline(always)]
+    fn panels_small(&self, a: &[f32], m: usize, bias: Option<&[f32]>, jp0: usize, jp1: usize, o: &mut [f32]) {
+        let (n, k) = (self.n, self.k);
+        let w = (jp1 - jp0) * NR;
+        // few rows on x86-64: several panels at a time (four for one or two rows, two for three or four on AVX-512)
+        #[cfg(target_arch = "x86_64")]
+        let start = {
+            let mut jp = jp0;
+            let lvl = x86();
+            let pp = if m <= 2 && lvl >= X86::Avx2 { 4 } else if m <= 4 && lvl >= X86::Avx512 { 2 } else { 0 };
+            if pp > 0 {
+                let zero = [0f32; 4 * NR];
+                while jp + pp <= jp1 && (jp + pp) * NR <= n {
+                    let init = bias.map_or(&zero[..], |b| &b[jp * NR..(jp + pp) * NR]);
+                    let c0 = (jp - jp0) * NR;
+                    assert!(a.len() >= m * k && c0 + pp * NR + (m - 1) * w <= o.len() && self.q.len() >= (jp + pp) * k * NR && self.s.len() >= (jp + pp) * NR);
+                    #[allow(unsafe_code)]
+                    // SAFETY: panels jp..jp + pp of q (k x NR each), their pp x NR scales and init values, m rows of k
+                    // in a, pp x NR columns of m rows of o (row stride w) from c0 (asserted); the level was detected on
+                    // this CPU.
+                    unsafe {
+                        let (q, sc, op) = (self.q.as_ptr().add(jp * k * NR), self.s.as_ptr().add(jp * NR), o.as_mut_ptr().add(c0));
+                        match (lvl, m) {
+                            (X86::Avx512, 4) => x86::q8p_avx512::<4, 2>(a.as_ptr(), k, q, sc, init.as_ptr(), op, w),
+                            (X86::Avx512, 3) => x86::q8p_avx512::<3, 2>(a.as_ptr(), k, q, sc, init.as_ptr(), op, w),
+                            (X86::Avx512, 2) => x86::q8p_avx512::<2, 4>(a.as_ptr(), k, q, sc, init.as_ptr(), op, w),
+                            (X86::Avx512, _) => x86::q8p_avx512::<1, 4>(a.as_ptr(), k, q, sc, init.as_ptr(), op, w),
+                            (_, 2) => x86::q8p_avx2::<2>(a.as_ptr(), k, q, sc, init.as_ptr(), op, w),
+                            _ => x86::q8p_avx2::<1>(a.as_ptr(), k, q, sc, init.as_ptr(), op, w),
+                        }
+                    }
+                    jp += pp;
+                }
+            }
+            jp
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let start = jp0;
+        for jp in start..jp1 {
+            let j0 = jp * NR;
+            let cols = NR.min(n - j0);
+            let mut init = [0f32; NR];
+            if let Some(b) = bias {
+                init[..cols].copy_from_slice(&b[j0..j0 + cols]);
+            }
+            let panel = &self.q[jp * k * NR..(jp + 1) * k * NR];
+            let sc: &[f32; NR] = self.s[j0..j0 + NR].try_into().unwrap();
+            let mut i = 0;
+            while i < m {
+                let rows = 4.min(m - i);
+                let mut tile = [[0f32; NR]; 4];
+                let a = &a[i * k..(i + rows) * k];
+                match rows {
+                    4 => kernel_q8::<4>(a, k, panel, sc, &init, &mut tile),
+                    3 => kernel_q8::<3>(a, k, panel, sc, &init, (&mut tile[..3]).try_into().unwrap()),
+                    2 => kernel_q8::<2>(a, k, panel, sc, &init, (&mut tile[..2]).try_into().unwrap()),
+                    _ => kernel_q8::<1>(a, k, panel, sc, &init, (&mut tile[..1]).try_into().unwrap()),
+                }
+                for r in 0..rows {
+                    let o0 = (i + r) * w + (jp - jp0) * NR;
+                    o[o0..o0 + NR].copy_from_slice(&tile[r]);
+                }
+                i += rows;
+            }
+        }
+    }
+}
+
 impl Panels for QuantF {
     fn n(&self) -> usize {
         self.n
@@ -1429,6 +1792,925 @@ impl Linear {
             Weight::F32(p) => gemm(x, m, p, self.b.as_deref()),
             Weight::Int(q) => q.gemm(x, m, self.b.as_deref()),
             Weight::I8(q) => q.gemm(x, m, self.b.as_deref()),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------- x86-64
+
+/// SIMD level of an x86-64 CPU, detected at run time: SSE2 (every x86-64; what the plain Rust auto-vectorizes to),
+/// AVX2 with FMA (Haswell, Zen 1 on), AVX-512 F/BW/DQ/VL (Skylake-X, Ice Lake, Zen 4 on). Every level computes the
+/// same products and sums in the same order: the same bits. std builds: TINYASR_X86=sse2|avx2 caps it (for tests).
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum X86 {
+    Sse2,
+    Avx2,
+    Avx512,
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn x86() -> X86 {
+    use core::sync::atomic::{AtomicU8, Ordering};
+    // 0 not known yet, else X86 as u8 + 1
+    static L: AtomicU8 = AtomicU8::new(0);
+    let v = L.load(Ordering::Relaxed);
+    if v != 0 {
+        return [X86::Sse2, X86::Avx2, X86::Avx512][v as usize - 1];
+    }
+    #[cfg(feature = "std")]
+    let l = {
+        use std::arch::is_x86_feature_detected as has;
+        let avx2 = has!("avx2") && has!("fma");
+        let avx512 = avx2 && has!("avx512f") && has!("avx512bw") && has!("avx512dq") && has!("avx512vl");
+        let l = if avx512 { X86::Avx512 } else if avx2 { X86::Avx2 } else { X86::Sse2 };
+        match std::env::var("TINYASR_X86").as_deref() {
+            Ok("sse2") => X86::Sse2,
+            Ok("avx2") => l.min(X86::Avx2),
+            _ => l,
+        }
+    };
+    #[cfg(not(feature = "std"))]
+    let l = if cfg!(all(target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq", target_feature = "avx512vl")) {
+        X86::Avx512
+    } else if cfg!(all(target_feature = "avx2", target_feature = "fma")) {
+        X86::Avx2
+    } else {
+        X86::Sse2
+    };
+    L.store(l as u8 + 1, Ordering::Relaxed);
+    l
+}
+
+/// Activations for the x86-64 integer kernels: rows of int8 codes (quantized as `pack_act`), per row and group the
+/// scale (max / 127) and the sum of the codes.
+#[cfg(target_arch = "x86_64")]
+struct ActX {
+    q: Vec<i8>,
+    s: Vec<f32>,
+    sum: Vec<i32>,
+    k: usize,
+    ng: usize,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl ActX {
+    fn new(a: &[f32], m: usize, k: usize, g: usize) -> ActX {
+        let ng = k / g;
+        let (mut q, mut s, mut sum) = (vec![0i8; m * k], vec![0f32; m * ng], vec![0i32; m * ng]);
+        if g.is_multiple_of(16) && x86() >= X86::Avx2 {
+            assert!(a.len() >= m * k);
+            #[allow(unsafe_code)]
+            // SAFETY: a holds m rows of k, q m x k, s and sum m x ng (just made); the level was detected on this CPU.
+            unsafe {
+                if x86() >= X86::Avx512 { x86::act_avx512(a, m, k, g, &mut q, &mut s, &mut sum) } else { x86::act_avx2(a, m, k, g, &mut q, &mut s, &mut sum) }
+            }
+            return ActX { q, s, sum, k, ng };
+        }
+        vector(#[inline(always)] || {
+            for r in 0..m {
+                for c in 0..ng {
+                    let x = &a[r * k + c * g..r * k + (c + 1) * g];
+                    let max = absmax(x);
+                    let inv = if max > 0.0 { 127.0 / max } else { 0.0 };
+                    let qr = &mut q[r * k + c * g..r * k + (c + 1) * g];
+                    // `quant8`, vectorizable: half away from zero, truncated, to int through the float's bits (exact
+                    // for |v| < 2^22; finite activations give |v| <= 127.5)
+                    let mut sm = 0i32;
+                    for (o, v) in qr.iter_mut().zip(x) {
+                        let r = v * inv;
+                        let y = r + 0.5f32.copysign(r);
+                        // y truncated: rounded to nearest by adding and taking away 1.5 * 2^23, then one step back
+                        // toward zero if that went past y
+                        let n = (y + 12_582_912.0) - 12_582_912.0;
+                        let t = if y >= 0.0 { if n > y { n - 1.0 } else { n } } else if n < y { n + 1.0 } else { n };
+                        let i = (t + 12_582_912.0).to_bits() as i32 - 0x4b40_0000;
+                        *o = i as i8;
+                        sm += i;
+                    }
+                    s[r * ng + c] = max / 127.0;
+                    sum[r * ng + c] = sm;
+                }
+            }
+        });
+        ActX { q, s, sum, k, ng }
+    }
+
+    fn rows(&self) -> usize {
+        self.q.len() / self.k
+    }
+}
+
+/// The x86-64 integer kernel of this CPU (`Path::X86`).
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IntX86 {
+    /// AVX2: `vpmaddubsw` (unsigned weight x signed activation pairs into int16) + `vpmaddwd`.
+    Avx2,
+    /// AVX-VNNI (Alder Lake, Zen 5 on): `vpdpbusd` on ymm.
+    AvxVnni,
+    /// AVX-512 VNNI (Ice Lake, Zen 4 on): `vpdpbusd` on zmm.
+    Avx512Vnni,
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn int_x86() -> IntX86 {
+    #[cfg(feature = "std")]
+    {
+        static K: std::sync::OnceLock<IntX86> = std::sync::OnceLock::new();
+        *K.get_or_init(|| {
+            use std::arch::is_x86_feature_detected as has;
+            let lvl = x86();
+            let forced = std::env::var("TINYASR_INT_X86");
+            if lvl >= X86::Avx512 && has!("avx512vnni") && forced.as_deref().is_err() {
+                IntX86::Avx512Vnni
+            } else if has!("avxvnni") && forced.as_deref() != Ok("avx2") {
+                IntX86::AvxVnni
+            } else {
+                IntX86::Avx2
+            }
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    if cfg!(all(target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq", target_feature = "avx512vl", target_feature = "avx512vnni")) {
+        IntX86::Avx512Vnni
+    } else if cfg!(target_feature = "avxvnni") {
+        IntX86::AvxVnni
+    } else {
+        IntX86::Avx2
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_code, clippy::needless_range_loop)]
+mod x86 {
+    use super::NR;
+    use core::arch::x86_64::*;
+
+    /// `kernel` on AVX2: R rows x 16 columns in 2R ymm accumulators; product, then sum (not fused): the same bits.
+    #[inline(always)]
+    unsafe fn kernel_avx2<const R: usize>(a: *const f32, k: usize, panel: *const f32, init: &[f32; NR], out: &mut [[f32; NR]]) {
+        // SAFETY: the caller's a holds R rows of k, panel k x 16, out R rows.
+        unsafe {
+            let start = [_mm256_loadu_ps(init.as_ptr()), _mm256_loadu_ps(init.as_ptr().add(8))];
+            let mut acc = [start; R];
+            for p in 0..k {
+                let b = panel.add(p * NR);
+                let (b0, b1) = (_mm256_loadu_ps(b), _mm256_loadu_ps(b.add(8)));
+                for r in 0..R {
+                    let x = _mm256_broadcast_ss(&*a.add(r * k + p));
+                    acc[r][0] = _mm256_add_ps(acc[r][0], _mm256_mul_ps(x, b0));
+                    acc[r][1] = _mm256_add_ps(acc[r][1], _mm256_mul_ps(x, b1));
+                }
+            }
+            for r in 0..R {
+                _mm256_storeu_ps(out[r].as_mut_ptr(), acc[r][0]);
+                _mm256_storeu_ps(out[r].as_mut_ptr().add(8), acc[r][1]);
+            }
+        }
+    }
+
+    /// `kernel` on AVX-512: R rows x 16 columns, one zmm accumulator per row.
+    #[inline(always)]
+    unsafe fn kernel_avx512<const R: usize>(a: *const f32, k: usize, panel: *const f32, init: &[f32; NR], out: &mut [[f32; NR]]) {
+        // SAFETY: as `kernel_avx2`.
+        unsafe {
+            let mut acc = [_mm512_loadu_ps(init.as_ptr()); R];
+            for p in 0..k {
+                let b = _mm512_loadu_ps(panel.add(p * NR));
+                for r in 0..R {
+                    acc[r] = _mm512_add_ps(acc[r], _mm512_mul_ps(_mm512_set1_ps(*a.add(r * k + p)), b));
+                }
+            }
+            for r in 0..R {
+                _mm512_storeu_ps(out[r].as_mut_ptr(), acc[r]);
+            }
+        }
+    }
+
+    /// `super::rows` with MR rows per call (fewer for the last ones).
+    macro_rules! rows {
+        ($name:ident, $feat:literal, $kernel:ident, $mr:literal, $($r:literal)*) => {
+            #[target_feature(enable = $feat)]
+            pub unsafe fn $name(a: &[f32], k: usize, panel: &[f32], init: &[f32; NR], out: &mut [f32], stride: usize, cols: usize) {
+                let m = a.len() / k;
+                assert!(panel.len() >= k * NR && cols <= NR && (m == 0 || out.len() >= (m - 1) * stride + cols));
+                let mut tile = [[0f32; NR]; $mr];
+                let mut i = 0;
+                while i < m {
+                    let rows = (m - i).min($mr);
+                    // SAFETY: rows i..i + rows of a, the whole panel (asserted).
+                    unsafe {
+                        match rows {
+                            $($r => $kernel::<$r>(a.as_ptr().add(i * k), k, panel.as_ptr(), init, &mut tile),)*
+                            _ => unreachable!(),
+                        }
+                    }
+                    for r in 0..rows {
+                        out[(i + r) * stride..(i + r) * stride + cols].copy_from_slice(&tile[r][..cols]);
+                    }
+                    i += rows;
+                }
+            }
+        };
+    }
+    rows!(rows_avx2, "avx2,fma", kernel_avx2, 6, 1 2 3 4 5 6);
+    rows!(rows_avx512, "avx512f,avx512bw,avx512dq,avx512vl,avx2,fma", kernel_avx512, 12, 1 2 3 4 5 6 7 8 9 10 11 12);
+
+    /// One 64-byte block of an integer panel (8 outputs x 8 bytes, in pairs [output 2p | output 2p + 1]) transposed:
+    /// vector j holds byte 2j of outputs 0..8 (low half), byte 2j + 1 (high half).
+    #[inline(always)]
+    unsafe fn transpose(wp: *const u8) -> [__m128i; 4] {
+        // SAFETY: the caller's wp points to 64 bytes; SSSE3 is part of every level that calls this.
+        unsafe {
+            let wp = wp as *const __m128i;
+            // 16-bit lanes (output 2p, 2p + 1) of byte i
+            let il = _mm_setr_epi8(0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15);
+            let q: [__m128i; 4] = core::array::from_fn(|p| _mm_shuffle_epi8(_mm_loadu_si128(wp.add(p)), il));
+            // 32-bit lanes: outputs 0..4 (resp. 4..8) of bytes 0..4 and 4..8
+            let (l01, h01) = (_mm_unpacklo_epi16(q[0], q[1]), _mm_unpackhi_epi16(q[0], q[1]));
+            let (l23, h23) = (_mm_unpacklo_epi16(q[2], q[3]), _mm_unpackhi_epi16(q[2], q[3]));
+            [_mm_unpacklo_epi32(l01, l23), _mm_unpackhi_epi32(l01, l23), _mm_unpacklo_epi32(h01, h23), _mm_unpackhi_epi32(h01, h23)]
+        }
+    }
+
+    /// `Quant` times R rows with the weights widened in registers (no f32 panel), AVX2: 8 outputs (one integer panel,
+    /// ymm). Per output the sum of the panel path (init, then + x * w in k order, product then sum): the same bits.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn quant8_avx2<const R: usize, const INT4: bool>(a: *const f32, k: usize, w: *const u8, s: *const f32, g: usize, init: *const f32, out: *mut f32, stride: usize) {
+        let ks = if INT4 { 16 } else { 8 };
+        // SAFETY: the caller's a holds R rows of k, w one panel, s its scales, out R rows of 8 at `stride`.
+        unsafe {
+            let mask = _mm_set1_epi8(0xf0u8 as i8);
+            let mut acc = [_mm256_loadu_ps(init); R];
+            for b in 0..k / ks {
+                let k0 = b * ks;
+                let sc = _mm256_loadu_ps(s.add(k0 / g * 8));
+                let t = transpose(w.add(b * 64));
+                let byte = |i: usize| if i.is_multiple_of(2) { t[i / 2] } else { _mm_unpackhi_epi64(t[i / 2], t[i / 2]) };
+                let wv = |v: __m128i| _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v)), sc);
+                for h in 0..if INT4 { 2 } else { 1 } {
+                    for i in 0..8 {
+                        let v = byte(i);
+                        let wf = wv(if !INT4 { v } else if h == 0 { _mm_and_si128(_mm_slli_epi16::<4>(v), mask) } else { _mm_and_si128(v, mask) });
+                        let kk = k0 + 8 * h + i;
+                        for r in 0..R {
+                            acc[r] = _mm256_add_ps(acc[r], _mm256_mul_ps(_mm256_broadcast_ss(&*a.add(r * k + kk)), wf));
+                        }
+                    }
+                }
+            }
+            for r in 0..R {
+                _mm256_storeu_ps(out.add(r * stride), acc[r]);
+            }
+        }
+    }
+
+    /// As `quant8_avx2` on AVX-512: 16 outputs (two integer panels w0, w1 with scales s0, s1; zmm).
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn quant16_avx512<const R: usize, const INT4: bool>(a: *const f32, k: usize, w0: *const u8, w1: *const u8, s0: *const f32, s1: *const f32, g: usize, init: *const f32, out: *mut f32, stride: usize) {
+        let ks = if INT4 { 16 } else { 8 };
+        // SAFETY: as `quant8_avx2`, for two panels and 16 outputs.
+        unsafe {
+            let mask = _mm_set1_epi8(0xf0u8 as i8);
+            let mut acc = [_mm512_loadu_ps(init); R];
+            for b in 0..k / ks {
+                let k0 = b * ks;
+                let sc = _mm512_insertf32x8::<1>(_mm512_castps256_ps512(_mm256_loadu_ps(s0.add(k0 / g * 8))), _mm256_loadu_ps(s1.add(k0 / g * 8)));
+                let (t0, t1) = (transpose(w0.add(b * 64)), transpose(w1.add(b * 64)));
+                // byte i of outputs 0..8 (low half), 8..16 (high half)
+                let byte = |i: usize| if i.is_multiple_of(2) { _mm_unpacklo_epi64(t0[i / 2], t1[i / 2]) } else { _mm_unpackhi_epi64(t0[i / 2], t1[i / 2]) };
+                let wv = |v: __m128i| _mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(v)), sc);
+                for h in 0..if INT4 { 2 } else { 1 } {
+                    for i in 0..8 {
+                        let v = byte(i);
+                        let wf = wv(if !INT4 { v } else if h == 0 { _mm_and_si128(_mm_slli_epi16::<4>(v), mask) } else { _mm_and_si128(v, mask) });
+                        let kk = k0 + 8 * h + i;
+                        for r in 0..R {
+                            acc[r] = _mm512_add_ps(acc[r], _mm512_mul_ps(_mm512_set1_ps(*a.add(r * k + kk)), wf));
+                        }
+                    }
+                }
+            }
+            for r in 0..R {
+                _mm512_storeu_ps(out.add(r * stride), acc[r]);
+            }
+        }
+    }
+
+    /// `Quant` panels jp0..jp1 (of 8 outputs) times m rows into o (row r at r * stride, panel jp at (jp - jp0) * 8;
+    /// whole panels: o is wide enough), bias in `init` (8 per panel), weights widened in registers.
+    #[target_feature(enable = "avx2,fma")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn quant_avx2(q: &super::Quant, a: &[f32], m: usize, init: &[f32], jp0: usize, jp1: usize, o: &mut [f32], stride: usize) {
+        let (k, g, ng, pb) = (q.k, q.group, q.k / q.group, q.panel_bytes());
+        assert!(a.len() >= m * k && init.len() >= jp1 * 8 && q.w.len() >= jp1 * pb && q.s.len() >= jp1 * ng * 8 && (m == 0 || o.len() >= (m - 1) * stride + (jp1 - jp0) * 8));
+        for jp in jp0..jp1 {
+            let mut i = 0;
+            while i < m {
+                let rows = (m - i).min(8);
+                // SAFETY: rows i..i + rows, panel jp, its 8 outputs of o (asserted).
+                unsafe {
+                    let (ap, w, s, ip, op) = (a.as_ptr().add(i * k), q.w.as_ptr().add(jp * pb), q.s.as_ptr().add(jp * ng * 8), init.as_ptr().add(jp * 8), o.as_mut_ptr().add(i * stride + (jp - jp0) * 8));
+                    macro_rules! go {
+                        ($($r:literal)*) => {
+                            match (rows, q.int4) {
+                                $(($r, true) => quant8_avx2::<$r, true>(ap, k, w, s, g, ip, op, stride),
+                                ($r, false) => quant8_avx2::<$r, false>(ap, k, w, s, g, ip, op, stride),)*
+                                _ => unreachable!(),
+                            }
+                        };
+                    }
+                    go!(1 2 3 4 5 6 7 8);
+                }
+                i += rows;
+            }
+        }
+    }
+
+    /// `quant_avx2` on AVX-512, two panels at a time (jp0 even; a last odd panel pairs with zero scales, so its
+    /// missing outputs are zeros: o must be wide enough for whole pairs).
+    #[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vl,avx2,fma")]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn quant_avx512(q: &super::Quant, a: &[f32], m: usize, init: &[f32], jp0: usize, jp1: usize, o: &mut [f32], stride: usize) {
+        let (k, g, ng, pb) = (q.k, q.group, q.k / q.group, q.panel_bytes());
+        let np = q.n.div_ceil(8);
+        let pairs = (jp1 - jp0).div_ceil(2);
+        assert!(jp0.is_multiple_of(2) && jp1 <= np && a.len() >= m * k && init.len() >= jp0 * 8 + pairs * 16 && q.w.len() >= jp1 * pb && q.s.len() >= jp1 * ng * 8);
+        assert!(m == 0 || o.len() >= (m - 1) * stride + pairs * 16);
+        let zero = vec![0f32; ng * 8];
+        for pp in 0..pairs {
+            let (j0, j1) = (jp0 + 2 * pp, jp0 + 2 * pp + 1);
+            let mut i = 0;
+            while i < m {
+                let rows = (m - i).min(8);
+                // SAFETY: rows i..i + rows, panels j0 and j1 (or j0 again, with zero scales), their 16 outputs of o.
+                unsafe {
+                    let ap = a.as_ptr().add(i * k);
+                    let (w0, s0) = (q.w.as_ptr().add(j0 * pb), q.s.as_ptr().add(j0 * ng * 8));
+                    let (w1, s1) = if j1 < jp1 { (q.w.as_ptr().add(j1 * pb), q.s.as_ptr().add(j1 * ng * 8)) } else { (w0, zero.as_ptr()) };
+                    let (ip, op) = (init.as_ptr().add(j0 * 8), o.as_mut_ptr().add(i * stride + 2 * pp * 8));
+                    macro_rules! go {
+                        ($($r:literal)*) => {
+                            match (rows, q.int4) {
+                                $(($r, true) => quant16_avx512::<$r, true>(ap, k, w0, w1, s0, s1, g, ip, op, stride),
+                                ($r, false) => quant16_avx512::<$r, false>(ap, k, w0, w1, s0, s1, g, ip, op, stride),)*
+                                _ => unreachable!(),
+                            }
+                        };
+                    }
+                    go!(1 2 3 4 5 6 7 8);
+                }
+                i += rows;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ integer weights x int8 activations
+    //
+    // A 64-byte block of an integer panel is 8 outputs x 8 bytes (output o at byte 8o): its 32-bit lanes 2o, 2o + 1
+    // hold k-steps 0..4, 4..8 of output o, so a row's 8 activation bytes broadcast to every 64-bit lane line up with
+    // them. Weights become the unsigned operand: int4 nibble + 8 (0..=15), int8 code + 128; offset x (sum of the
+    // row's codes in the group) comes off at the group end. Integer sums are exact in any order: the same int32 as
+    // `tile_scalar`, then the same float steps (int4: x 16, times sa * sw, added group by group).
+
+    /// R rows x one panel (8 outputs) on AVX-512 VNNI: per row one zmm of lane pairs.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn int512<const R: usize, const INT4: bool, const _V: bool>(act: &super::ActX, r0: usize, w: *const u8, sw: *const f32, g: usize, o: *mut f32, stride: usize, init: *const f32, c: usize) {
+        let (k, ng) = (act.k, act.ng);
+        let ks = if INT4 { 16 } else { 8 };
+        // SAFETY: rows r0..r0 + R of act (the caller checks), one panel of w and its ng x 8 scales.
+        unsafe {
+            let aq = act.q.as_ptr().add(r0 * k);
+            let (m0f, m88, m80) = (_mm512_set1_epi8(0x0f), _mm512_set1_epi8(0x88u8 as i8), _mm512_set1_epi8(0x80u8 as i8));
+            let mut f = [_mm256_setzero_ps(); R];
+            for c in 0..ng {
+                let mut acc = [_mm512_setzero_si512(); R];
+                for b in c * g / ks..(c + 1) * g / ks {
+                    let v = _mm512_loadu_si512(w.add(b * 64) as *const _);
+                    let k0 = b * ks;
+                    let a8 = |r: usize, kk: usize| _mm512_set1_epi64((aq.add(r * k + kk) as *const i64).read_unaligned());
+                    if INT4 {
+                        let lo = _mm512_and_si512(_mm512_xor_si512(v, m88), m0f);
+                        let hi = _mm512_and_si512(_mm512_srli_epi16::<4>(_mm512_xor_si512(v, m88)), m0f);
+                        for r in 0..R {
+                            acc[r] = _mm512_dpbusd_epi32(acc[r], lo, a8(r, k0));
+                            acc[r] = _mm512_dpbusd_epi32(acc[r], hi, a8(r, k0 + 8));
+                        }
+                    } else {
+                        let u = _mm512_xor_si512(v, m80);
+                        for r in 0..R {
+                            acc[r] = _mm512_dpbusd_epi32(acc[r], u, a8(r, k0));
+                        }
+                    }
+                }
+                let sw8 = _mm256_loadu_ps(sw.add(c * 8));
+                for r in 0..R {
+                    // lane pairs added: output o in the low half of 64-bit lane o
+                    let d = _mm512_cvtepi64_epi32(_mm512_add_epi32(acc[r], _mm512_srli_epi64::<32>(acc[r])));
+                    let i = (r0 + r) * ng + c;
+                    f[r] = step::<INT4>(f[r], d, *act.sum.as_ptr().add(i), *act.s.as_ptr().add(i), sw8);
+                }
+            }
+            // + bias, the first c columns of rows r0.. (o at row r0)
+            let mask = ((1u32 << c) - 1) as __mmask8;
+            let b = _mm256_maskz_loadu_ps(mask, init);
+            for r in 0..R {
+                _mm256_mask_storeu_ps(o.add(r * stride), mask, _mm256_add_ps(f[r], b));
+            }
+        }
+    }
+
+    /// `ActX::new` on AVX-512 (g a multiple of 16): per group absmax (NaN skipped, as `max`), codes rounded half away
+    /// from zero and truncated (`vcvttps2dq`: the same integers as `quant8`, |v| <= 127.5), their sum.
+    #[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vl,avx2,fma")]
+    pub unsafe fn act_avx512(a: &[f32], m: usize, k: usize, g: usize, q: &mut [i8], s: &mut [f32], sum: &mut [i32]) {
+        let ng = k / g;
+        assert!(g.is_multiple_of(16) && a.len() >= m * k && q.len() >= m * k && s.len() >= m * ng && sum.len() >= m * ng);
+        // SAFETY: every access is inside the m x k (q, a) and m x ng (s, sum) asserted above.
+        unsafe {
+            let (ap, qp) = (a.as_ptr(), q.as_mut_ptr());
+            let (half, sign) = (_mm512_set1_ps(0.5), _mm512_set1_ps(-0.0));
+            for i in 0..m * ng {
+                let x = ap.add(i * g);
+                let mut mx = _mm512_setzero_ps();
+                for j in (0..g).step_by(16) {
+                    // max(v, mx) is mx when v is NaN
+                    mx = _mm512_max_ps(_mm512_andnot_ps(sign, _mm512_loadu_ps(x.add(j))), mx);
+                }
+                let max = _mm512_reduce_max_ps(mx);
+                let inv = if max > 0.0 { 127.0 / max } else { 0.0 };
+                let vi = _mm512_set1_ps(inv);
+                let mut sm = _mm512_setzero_si512();
+                for j in (0..g).step_by(16) {
+                    let r = _mm512_mul_ps(_mm512_loadu_ps(x.add(j)), vi);
+                    let y = _mm512_add_ps(r, _mm512_or_ps(half, _mm512_and_ps(r, sign)));
+                    let t = _mm512_cvttps_epi32(y);
+                    sm = _mm512_add_epi32(sm, t);
+                    _mm_storeu_si128(qp.add(i * g + j) as *mut _, _mm512_cvtepi32_epi8(t));
+                }
+                *s.get_unchecked_mut(i) = max / 127.0;
+                *sum.get_unchecked_mut(i) = _mm512_reduce_add_epi32(sm);
+            }
+        }
+    }
+
+    /// `act_avx512` on AVX2.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn act_avx2(a: &[f32], m: usize, k: usize, g: usize, q: &mut [i8], s: &mut [f32], sum: &mut [i32]) {
+        let ng = k / g;
+        assert!(g.is_multiple_of(16) && a.len() >= m * k && q.len() >= m * k && s.len() >= m * ng && sum.len() >= m * ng);
+        // SAFETY: as `act_avx512`.
+        unsafe {
+            let (ap, qp) = (a.as_ptr(), q.as_mut_ptr());
+            let (half, sign) = (_mm256_set1_ps(0.5), _mm256_set1_ps(-0.0));
+            for i in 0..m * ng {
+                let x = ap.add(i * g);
+                let mut mx = [_mm256_setzero_ps(); 2];
+                for j in (0..g).step_by(16) {
+                    for h in 0..2 {
+                        mx[h] = _mm256_max_ps(_mm256_andnot_ps(sign, _mm256_loadu_ps(x.add(j + 8 * h))), mx[h]);
+                    }
+                }
+                // every lane is a non-NaN value >= 0: the maximum in any order
+                let m8 = _mm256_max_ps(mx[0], mx[1]);
+                let m4 = _mm_max_ps(_mm256_castps256_ps128(m8), _mm256_extractf128_ps::<1>(m8));
+                let m2 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+                let max = _mm_cvtss_f32(_mm_max_ss(m2, _mm_shuffle_ps::<1>(m2, m2)));
+                let inv = if max > 0.0 { 127.0 / max } else { 0.0 };
+                let vi = _mm256_set1_ps(inv);
+                let mut sm = _mm256_setzero_si256();
+                for j in (0..g).step_by(16) {
+                    let t: [__m256i; 2] = core::array::from_fn(|h| {
+                        let r = _mm256_mul_ps(_mm256_loadu_ps(x.add(j + 8 * h)), vi);
+                        _mm256_cvttps_epi32(_mm256_add_ps(r, _mm256_or_ps(half, _mm256_and_ps(r, sign))))
+                    });
+                    sm = _mm256_add_epi32(sm, _mm256_add_epi32(t[0], t[1]));
+                    // int32 -> int16 (lanes interleaved per 128 bits, put back in order) -> int8; |t| <= 127
+                    let p16 = _mm256_permute4x64_epi64::<0b11_01_10_00>(_mm256_packs_epi32(t[0], t[1]));
+                    let p8 = _mm_packs_epi16(_mm256_castsi256_si128(p16), _mm256_extracti128_si256::<1>(p16));
+                    _mm_storeu_si128(qp.add(i * g + j) as *mut _, p8);
+                }
+                *s.get_unchecked_mut(i) = max / 127.0;
+                let s4 = _mm_add_epi32(_mm256_castsi256_si128(sm), _mm256_extracti128_si256::<1>(sm));
+                let s2 = _mm_add_epi32(s4, _mm_unpackhi_epi64(s4, s4));
+                *sum.get_unchecked_mut(i) = _mm_cvtsi128_si32(_mm_add_epi32(s2, _mm_shuffle_epi32::<1>(s2)));
+            }
+        }
+    }
+
+    /// `kernel_q8` (non-aarch64) for R rows x P consecutive panels (q: P x k x NR codes, sc, init: P x NR) on
+    /// AVX-512, the PR sums independent; per output the same operations in the same order: the same bits.
+    #[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vl,avx2,fma")]
+    pub unsafe fn q8p_avx512<const R: usize, const P: usize>(a: *const f32, k: usize, q: *const i8, sc: *const f32, init: *const f32, o: *mut f32, stride: usize) {
+        // SAFETY: the caller's bounds (see the call).
+        unsafe {
+            let mut acc = [[_mm512_setzero_ps(); P]; R];
+            for p in 0..k {
+                let b: [__m512; P] = core::array::from_fn(|j| _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm_loadu_si128(q.add((j * k + p) * NR) as *const _))));
+                for r in 0..R {
+                    let x = _mm512_set1_ps(*a.add(r * k + p));
+                    for j in 0..P {
+                        acc[r][j] = _mm512_add_ps(acc[r][j], _mm512_mul_ps(x, b[j]));
+                    }
+                }
+            }
+            for r in 0..R {
+                for j in 0..P {
+                    let v = _mm512_add_ps(_mm512_loadu_ps(init.add(j * NR)), _mm512_mul_ps(acc[r][j], _mm512_loadu_ps(sc.add(j * NR))));
+                    _mm512_storeu_ps(o.add(r * stride + j * NR), v);
+                }
+            }
+        }
+    }
+
+    /// `q8p_avx512` (P = 4) on AVX2: every NR = 16 columns as two halves of 8.
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn q8p_avx2<const R: usize>(a: *const f32, k: usize, q: *const i8, sc: *const f32, init: *const f32, o: *mut f32, stride: usize) {
+        // SAFETY: the caller's bounds (see the call).
+        unsafe {
+            let mut acc = [[_mm256_setzero_ps(); 8]; R];
+            for p in 0..k {
+                let b: [__m256; 8] = core::array::from_fn(|h| _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(q.add(((h / 2) * k + p) * NR + 8 * (h % 2)) as *const _))));
+                for r in 0..R {
+                    let x = _mm256_set1_ps(*a.add(r * k + p));
+                    for h in 0..8 {
+                        acc[r][h] = _mm256_add_ps(acc[r][h], _mm256_mul_ps(x, b[h]));
+                    }
+                }
+            }
+            for r in 0..R {
+                for h in 0..8 {
+                    let v = _mm256_add_ps(_mm256_loadu_ps(init.add(8 * h)), _mm256_mul_ps(acc[r][h], _mm256_loadu_ps(sc.add(8 * h))));
+                    _mm256_storeu_ps(o.add(r * stride + 8 * h), v);
+                }
+            }
+        }
+    }
+
+    /// `int512` for two panels (w, w + pb) at once: 16 outputs per zmm, the activation broadcasts and the group ends
+    /// shared. The same integer sums and float steps per output: the same bits.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn int512x2<const R: usize, const INT4: bool, const _V: bool>(act: &super::ActX, r0: usize, w: *const u8, pb: usize, sw: *const f32, swb: *const f32, g: usize, o: *mut f32, stride: usize, init: *const f32, c: usize) {
+        let (k, ng) = (act.k, act.ng);
+        let ks = if INT4 { 16 } else { 8 };
+        // SAFETY: rows r0..r0 + R of act (the caller checks), two panels of w and their ng x 8 scales each.
+        unsafe {
+            let aq = act.q.as_ptr().add(r0 * k);
+            let (m0f, m88, m80) = (_mm512_set1_epi8(0x0f), _mm512_set1_epi8(0x88u8 as i8), _mm512_set1_epi8(0x80u8 as i8));
+            // the low and high 32-bit lane of every 64-bit lane, panel a then panel b
+            let ev = _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30);
+            let od = _mm512_setr_epi32(1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31);
+            let mut f = [_mm512_setzero_ps(); R];
+            for c in 0..ng {
+                let mut acc = [[_mm512_setzero_si512(); 2]; R];
+                // one or two rows: the blocks alternate between two sets of sums, so the vpdpbusd are not one chain
+                // (integer sums: exact in any order)
+                let mut acc2 = [[_mm512_setzero_si512(); 2]; R];
+                macro_rules! blk {
+                    ($b:expr, $acc:ident) => {{
+                        let (b, acc) = ($b, &mut $acc);
+                        let k0 = b * ks;
+                        let a8 = |r: usize, kk: usize| _mm512_set1_epi64((aq.add(r * k + kk) as *const i64).read_unaligned());
+                        let v = [_mm512_loadu_si512(w.add(b * 64) as *const _), _mm512_loadu_si512(w.add(pb + b * 64) as *const _)];
+                        if INT4 {
+                            let v = v.map(|v| _mm512_xor_si512(v, m88));
+                            let lo = v.map(|v| _mm512_and_si512(v, m0f));
+                            let hi = v.map(|v| _mm512_and_si512(_mm512_srli_epi16::<4>(v), m0f));
+                            for r in 0..R {
+                                let (x, y) = (a8(r, k0), a8(r, k0 + 8));
+                                for p in 0..2 {
+                                    acc[r][p] = _mm512_dpbusd_epi32(acc[r][p], lo[p], x);
+                                    acc[r][p] = _mm512_dpbusd_epi32(acc[r][p], hi[p], y);
+                                }
+                            }
+                        } else {
+                            let u = v.map(|v| _mm512_xor_si512(v, m80));
+                            for r in 0..R {
+                                let x = a8(r, k0);
+                                for p in 0..2 {
+                                    acc[r][p] = _mm512_dpbusd_epi32(acc[r][p], u[p], x);
+                                }
+                            }
+                        }
+                    }};
+                }
+                let (b0, b1) = (c * g / ks, (c + 1) * g / ks);
+                if R <= 2 {
+                    let mut b = b0;
+                    while b + 2 <= b1 {
+                        blk!(b, acc);
+                        blk!(b + 1, acc2);
+                        b += 2;
+                    }
+                    if b < b1 {
+                        blk!(b, acc);
+                    }
+                    for r in 0..R {
+                        for p in 0..2 {
+                            acc[r][p] = _mm512_add_epi32(acc[r][p], acc2[r][p]);
+                        }
+                    }
+                } else {
+                    for b in b0..b1 {
+                        blk!(b, acc);
+                    }
+                }
+                let sw16 = _mm512_insertf32x8::<1>(_mm512_castps256_ps512(_mm256_loadu_ps(sw.add(c * 8))), _mm256_loadu_ps(swb.add(c * 8)));
+                for r in 0..R {
+                    let (x, y) = (acc[r][0], acc[r][1]);
+                    let d = _mm512_add_epi32(_mm512_permutex2var_epi32(x, ev, y), _mm512_permutex2var_epi32(x, od, y));
+                    let i = (r0 + r) * ng + c;
+                    let (sum, sa) = (*act.sum.as_ptr().add(i), *act.s.as_ptr().add(i));
+                    let d = _mm512_sub_epi32(d, _mm512_set1_epi32(if INT4 { 8 } else { 128 } * sum));
+                    let d = if INT4 { _mm512_slli_epi32::<4>(d) } else { d };
+                    f[r] = _mm512_add_ps(f[r], _mm512_mul_ps(_mm512_cvtepi32_ps(d), _mm512_mul_ps(_mm512_set1_ps(sa), sw16)));
+                }
+            }
+            let mask = ((1u32 << c) - 1) as __mmask16;
+            let b = _mm512_maskz_loadu_ps(mask, init);
+            for r in 0..R {
+                _mm512_mask_storeu_ps(o.add(r * stride), mask, _mm512_add_ps(f[r], b));
+            }
+        }
+    }
+
+    /// Group end: f + (d - offset x sum) (x 16 for int4) as f32 x (sa x sw).
+    #[inline(always)]
+    unsafe fn step<const INT4: bool>(f: __m256, d: __m256i, sum: i32, sa: f32, sw8: __m256) -> __m256 {
+        // SAFETY: register-only AVX2.
+        unsafe {
+            let d = _mm256_sub_epi32(d, _mm256_set1_epi32(if INT4 { 8 } else { 128 } * sum));
+            let d = if INT4 { _mm256_slli_epi32::<4>(d) } else { d };
+            _mm256_add_ps(f, _mm256_mul_ps(_mm256_cvtepi32_ps(d), _mm256_mul_ps(_mm256_set1_ps(sa), sw8)))
+        }
+    }
+
+    /// acc + the 4-byte dot products of unsigned w and signed a per 32-bit lane: AVX-VNNI `vpdpbusd`, or AVX2
+    /// `vpmaddubsw` + `vpmaddwd` (exact while w x a pairs fit int16: w <= 15, |a| <= 127 for int4).
+    #[inline(always)]
+    unsafe fn dp<const VNNI: bool>(acc: __m256i, w: __m256i, a: __m256i) -> __m256i {
+        // SAFETY: register-only; the caller enables avxvnni when VNNI.
+        unsafe {
+            if VNNI {
+                _mm256_dpbusd_avx_epi32(acc, w, a)
+            } else {
+                _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(w, a), _mm256_set1_epi16(1)))
+            }
+        }
+    }
+
+    /// int8 weights on plain AVX2: w + 128 x a overflows `vpmaddubsw`'s int16, so |w| x (a with w's sign) instead
+    /// (pairs <= 2 x 128 x 127 < 2^15: exact); `wa` = |w|.
+    #[inline(always)]
+    unsafe fn dp8(acc: __m256i, wa: __m256i, w: __m256i, a: __m256i) -> __m256i {
+        // SAFETY: register-only AVX2.
+        unsafe { _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(wa, _mm256_sign_epi8(a, w)), _mm256_set1_epi16(1))) }
+    }
+
+    /// R rows x one panel on AVX2 / AVX-VNNI: per row two ymm (outputs 0..4, 4..8) of lane pairs.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn int256<const R: usize, const INT4: bool, const VNNI: bool>(act: &super::ActX, r0: usize, w: *const u8, sw: *const f32, g: usize, o: *mut f32, stride: usize, init: *const f32, c: usize) {
+        let (k, ng) = (act.k, act.ng);
+        let ks = if INT4 { 16 } else { 8 };
+        // SAFETY: as `int512`.
+        unsafe {
+            let aq = act.q.as_ptr().add(r0 * k);
+            let (m0f, m88, m80) = (_mm256_set1_epi8(0x0f), _mm256_set1_epi8(0x88u8 as i8), _mm256_set1_epi8(0x80u8 as i8));
+            let mut f = [_mm256_setzero_ps(); R];
+            let ones = _mm256_set1_epi16(1);
+            let nb = g / ks;
+            for c in 0..ng {
+                let mut acc = [[_mm256_setzero_si256(); 2]; R];
+                if INT4 && !VNNI && nb <= 4 {
+                    // the whole group in int16 sums: no int32 accumulator alive across blocks (16 ymm registers)
+                    let mut s16 = [[_mm256_setzero_si256(); 2]; R];
+                    for b in c * nb..(c + 1) * nb {
+                        let k0 = b * ks;
+                        for h in 0..2 {
+                            let v = _mm256_loadu_si256(w.add(b * 64 + 32 * h) as *const _);
+                            let lo = _mm256_and_si256(_mm256_xor_si256(v, m88), m0f);
+                            let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(_mm256_xor_si256(v, m88)), m0f);
+                            for r in 0..R {
+                                let x = _mm256_set1_epi64x((aq.add(r * k + k0) as *const i64).read_unaligned());
+                                let y = _mm256_set1_epi64x((aq.add(r * k + k0 + 8) as *const i64).read_unaligned());
+                                s16[r][h] = _mm256_add_epi16(s16[r][h], _mm256_add_epi16(_mm256_maddubs_epi16(lo, x), _mm256_maddubs_epi16(hi, y)));
+                            }
+                        }
+                    }
+                    for r in 0..R {
+                        for h in 0..2 {
+                            acc[r][h] = _mm256_madd_epi16(s16[r][h], ones);
+                        }
+                    }
+                }
+                let mut b = if INT4 && !VNNI && nb <= 4 { (c + 1) * nb } else { c * nb };
+                while b < (c + 1) * nb {
+                    // plain AVX2, int4: `vpmaddubsw` sums kept in int16 over up to 4 blocks (8 x 2 x 15 x 127 < 2^15)
+                    let be = if INT4 && !VNNI { (b + 4).min((c + 1) * nb) } else { (c + 1) * nb };
+                    let mut s16 = [[_mm256_setzero_si256(); 2]; R];
+                    for b in b..be {
+                        let k0 = b * ks;
+                        let a8 = |r: usize, kk: usize| _mm256_set1_epi64x((aq.add(r * k + kk) as *const i64).read_unaligned());
+                        for h in 0..2 {
+                            let v = _mm256_loadu_si256(w.add(b * 64 + 32 * h) as *const _);
+                            if INT4 {
+                                let lo = _mm256_and_si256(_mm256_xor_si256(v, m88), m0f);
+                                let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(_mm256_xor_si256(v, m88)), m0f);
+                                for r in 0..R {
+                                    if VNNI {
+                                        acc[r][h] = dp::<true>(acc[r][h], lo, a8(r, k0));
+                                        acc[r][h] = dp::<true>(acc[r][h], hi, a8(r, k0 + 8));
+                                    } else {
+                                        let p = _mm256_add_epi16(_mm256_maddubs_epi16(lo, a8(r, k0)), _mm256_maddubs_epi16(hi, a8(r, k0 + 8)));
+                                        s16[r][h] = _mm256_add_epi16(s16[r][h], p);
+                                    }
+                                }
+                            } else if VNNI {
+                                let u = _mm256_xor_si256(v, m80);
+                                for r in 0..R {
+                                    acc[r][h] = dp::<true>(acc[r][h], u, a8(r, k0));
+                                }
+                            } else {
+                                let va = _mm256_abs_epi8(v);
+                                for r in 0..R {
+                                    acc[r][h] = dp8(acc[r][h], va, v, a8(r, k0));
+                                }
+                            }
+                        }
+                    }
+                    if INT4 && !VNNI {
+                        for r in 0..R {
+                            for h in 0..2 {
+                                acc[r][h] = _mm256_add_epi32(acc[r][h], _mm256_madd_epi16(s16[r][h], ones));
+                            }
+                        }
+                    }
+                    b = be;
+                }
+                let sw8 = _mm256_loadu_ps(sw.add(c * 8));
+                for r in 0..R {
+                    // lane pairs added: [o0 o1 o4 o5 | o2 o3 o6 o7], then the 64-bit lanes in order
+                    let d = _mm256_permute4x64_epi64::<0b11_01_10_00>(_mm256_hadd_epi32(acc[r][0], acc[r][1]));
+                    let i = (r0 + r) * ng + c;
+                    // plain AVX2 int8 (`dp8`) works on the codes themselves: no offset
+                    let sum = if !INT4 && !VNNI { 0 } else { *act.sum.as_ptr().add(i) };
+                    f[r] = step::<INT4>(f[r], d, sum, *act.s.as_ptr().add(i), sw8);
+                }
+            }
+            // + bias, the first c columns of rows r0.. (o at row r0)
+            if c == 8 {
+                let b = _mm256_loadu_ps(init);
+                for r in 0..R {
+                    _mm256_storeu_ps(o.add(r * stride), _mm256_add_ps(f[r], b));
+                }
+            } else {
+                let mut t = [0f32; 8];
+                for r in 0..R {
+                    _mm256_storeu_ps(t.as_mut_ptr(), f[r]);
+                    for j in 0..c {
+                        *o.add(r * stride + j) = t[j] + *init.add(j);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `kern::<rows, int4, extra...>(args)` for rows 1..=8.
+    macro_rules! int_rows {
+        ($rows:expr, $int4:expr, $kern:ident, $v:tt, $args:tt) => {
+            int_rows!(@ $rows, $int4, $kern, $v, $args, 1 2 3 4 5 6 7 8)
+        };
+        (@ $rows:expr, $int4:expr, $kern:ident, $v:tt, $args:tt, $($r:literal)*) => {
+            match ($rows, $int4) {
+                $(($r, true) => $kern::<$r, true, $v> $args,
+                ($r, false) => $kern::<$r, false, $v> $args,)*
+                _ => unreachable!(),
+            }
+        };
+    }
+
+    /// Panels jp0..jp1 of q times all rows of `act` into o (row r at r * stride, panel jp at (jp - jp0) * 8, the first
+    /// `cols` columns), + init (bias per output).
+    #[allow(clippy::too_many_arguments)]
+    pub fn int(kern: super::IntX86, q: &super::Quant, act: &super::ActX, init: &[f32], jp0: usize, jp1: usize, cols: usize, o: &mut [f32], stride: usize) {
+        let m = act.rows();
+        assert!(m == 0 || o.len() >= (m - 1) * stride + cols);
+        // SAFETY: o holds the m rows of cols values (asserted).
+        unsafe { int_raw(kern, q, act, init, jp0, jp1, cols, o.as_mut_ptr(), stride) }
+    }
+
+    /// `int` into a raw o: tasks writing disjoint columns of the same rows.
+    ///
+    /// # Safety
+    /// o must be valid for writes of the m rows of `cols` values (row r at r * stride), not read or written by anyone
+    /// else meanwhile.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn int_raw(kern: super::IntX86, q: &super::Quant, act: &super::ActX, init: &[f32], jp0: usize, jp1: usize, cols: usize, o: *mut f32, stride: usize) {
+        let m = act.rows();
+        let (ng, pb) = (q.k / q.group, q.panel_bytes());
+        assert!(act.k == q.k && act.ng == ng && jp1 <= q.n.div_ceil(8) && init.len() >= jp1 * 8 && cols <= (jp1 - jp0) * 8);
+        macro_rules! drive {
+            ($name:ident, $feat:literal, $kern:ident, $v:tt, $mr:literal) => {{
+                #[target_feature(enable = $feat)]
+                #[allow(clippy::too_many_arguments)]
+                fn $name(q: &super::Quant, act: &super::ActX, init: &[f32], jp0: usize, jp1: usize, cols: usize, o: *mut f32, stride: usize, m: usize, ng: usize, pb: usize) {
+                    for jp in jp0..jp1 {
+                        let c0 = (jp - jp0) * 8;
+                        if c0 >= cols {
+                            break;
+                        }
+                        let c = (cols - c0).min(8);
+                        let mut i = 0;
+                        while i < m {
+                            let rows = (m - i).min($mr);
+                            // SAFETY: rows i..i + rows of act, panel jp, c columns of `rows` rows of o from (i, c0)
+                            // (asserted by `int`), init's 8 values from jp * 8.
+                            unsafe {
+                                let (w, sw) = (q.w.as_ptr().add(jp * pb), q.s.as_ptr().add(jp * ng * 8));
+                                let (op, ip) = (o.add(i * stride + c0), init.as_ptr().add(jp * 8));
+                                int_rows!(rows, q.int4, $kern, $v, (act, i, w, sw, q.group, op, stride, ip, c));
+                            }
+                            i += rows;
+                        }
+                    }
+                }
+                // SAFETY: `kern` was picked for this CPU (`int_x86`).
+                unsafe { $name(q, act, init, jp0, jp1, cols, o, stride, m, ng, pb) }
+            }};
+        }
+        match kern {
+            super::IntX86::Avx512Vnni => {
+                #[target_feature(enable = "avx512f,avx512bw,avx512dq,avx512vl,avx512vnni,avx2,fma")]
+                #[allow(clippy::too_many_arguments)]
+                fn d512(q: &super::Quant, act: &super::ActX, init: &[f32], jp0: usize, jp1: usize, cols: usize, o: *mut f32, stride: usize, m: usize, ng: usize, pb: usize) {
+                    const MR: usize = 6;
+                    let mut jp = jp0;
+                    while jp < jp1 {
+                        let c0 = (jp - jp0) * 8;
+                        if c0 >= cols {
+                            break;
+                        }
+                        // two panels when both are in range
+                        let two = jp + 1 < jp1 && c0 + 8 < cols;
+                        let c = (cols - c0).min(if two { 16 } else { 8 });
+                        let mut i = 0;
+                        while i < m {
+                            let rows = (m - i).min(if two { MR } else { 8 });
+                            // SAFETY: rows i..i + rows of act, panels jp (and jp + 1), c columns of `rows` rows of o
+                            // from (i, c0) (asserted by `int`), the c values of init from jp * 8.
+                            unsafe {
+                                let (w, sw) = (q.w.as_ptr().add(jp * pb), q.s.as_ptr().add(jp * ng * 8));
+                                let (op, ip) = (o.add(i * stride + c0), init.as_ptr().add(jp * 8));
+                                if two {
+                                    int_rows!(rows, q.int4, int512x2, true, (act, i, w, pb, sw, sw.add(ng * 8), q.group, op, stride, ip, c));
+                                } else {
+                                    int_rows!(rows, q.int4, int512, true, (act, i, w, sw, q.group, op, stride, ip, c));
+                                }
+                            }
+                            i += rows;
+                        }
+                        jp += if two { 2 } else { 1 };
+                    }
+                }
+                // SAFETY: `kern` was picked for this CPU (`int_x86`).
+                unsafe { d512(q, act, init, jp0, jp1, cols, o, stride, m, ng, pb) }
+            }
+            super::IntX86::AvxVnni => drive!(dvnni, "avxvnni,avx2,fma", int256, true, 4),
+            super::IntX86::Avx2 => drive!(d256, "avx2,fma", int256, false, 4),
+        }
+    }
+
+    /// `super::widen8` on AVX2: every 64-byte block (8 outputs x 8 bytes, in pairs) transposed in registers to 8
+    /// vectors of one byte of each output, widened to f32 and scaled (the same product: the same bits).
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn widen8(int4: bool, w: &[u8], s: &[f32], k: usize, g: usize, out: &mut [f32], c0: usize) {
+        let ks = if int4 { 16 } else { 8 };
+        assert!(w.len() >= k / ks * 64 && s.len() >= k / g * 8 && out.len() >= k * NR && c0 + 8 <= NR);
+        // SAFETY: block b reads w[64b..64b + 64] and the 8 scales of its group, writes rows k0..k0 + ks of out (asserted).
+        unsafe {
+            let mask = _mm_set1_epi8(0xf0u8 as i8);
+            let op = out.as_mut_ptr().add(c0);
+            for b in 0..k / ks {
+                let k0 = b * ks;
+                let sc = _mm256_loadu_ps(s.as_ptr().add(k0 / g * 8));
+                let t = transpose(w.as_ptr().add(b * 64));
+                for i in 0..8 {
+                    let v = if i % 2 == 0 { t[i / 2] } else { _mm_unpackhi_epi64(t[i / 2], t[i / 2]) };
+                    let f = |v: __m128i| _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v)), sc);
+                    if int4 {
+                        _mm256_storeu_ps(op.add((k0 + i) * NR), f(_mm_and_si128(_mm_slli_epi16::<4>(v), mask)));
+                        _mm256_storeu_ps(op.add((k0 + 8 + i) * NR), f(_mm_and_si128(v, mask)));
+                    } else {
+                        _mm256_storeu_ps(op.add((k0 + i) * NR), f(v));
+                    }
+                }
+            }
         }
     }
 }
@@ -1548,6 +2830,129 @@ mod tests {
         }
     }
 
+    /// The x86-64 integer kernels give the bits of the portable integer product (`tile_scalar`).
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    #[test]
+    fn x86_int_same_bits() {
+        if x86() < X86::Avx2 {
+            return;
+        }
+        let mut kerns = vec![IntX86::Avx2];
+        if std::arch::is_x86_feature_detected!("avxvnni") {
+            kerns.push(IntX86::AvxVnni);
+        }
+        if x86() >= X86::Avx512 && std::arch::is_x86_feature_detected!("avx512vnni") {
+            kerns.push(IntX86::Avx512Vnni);
+        }
+        let mut seed = 13;
+        for &(m, n, k, g, int4) in &[(1, 8, 64, 64, true), (5, 19, 128, 64, true), (33, 40, 512, 64, true), (3, 13, 512, 512, false), (36, 24, 96, 32, false), (2, 7, 32, 16, true), (17, 70, 1152, 1152, true), (9, 16, 64, 32, false), (1, 32, 512, 512, false), (2, 24, 1024, 64, true), (1, 40, 96, 32, false), (2, 16, 48, 48, true)] {
+            let codes: Vec<i8> = (0..n * k).map(|_| (rnd(&mut seed) * if int4 { 8.0 } else { 128.0 }).floor().clamp(if int4 { -8.0 } else { -128.0 }, if int4 { 7.0 } else { 127.0 }) as i8).collect();
+            let scales: Vec<f32> = (0..n * k / g).map(|_| 0.01 + rnd(&mut seed).abs() * 0.05).collect();
+            let q = Quant::new(n, k, g, int4, |j, p| codes[j * k + p], |j, c| scales[j * (k / g) + c]);
+            let a: Vec<f32> = (0..m * k).map(|i| if i % 97 == 3 { 0.0 } else { rnd(&mut seed) * 3.0 }).collect();
+            let bias: Vec<f32> = (0..n).map(|_| rnd(&mut seed)).collect();
+            // the portable product, kernel call by kernel call
+            let act = pack_act(&a, m, k, g, false);
+            let (pb, ng) = (q.panel_bytes(), k / g);
+            let mut want = vec![0f32; m * n];
+            for p in 0..m.div_ceil(2) {
+                for jp in 0..n.div_ceil(8) {
+                    let mut t = [[[0f32; 4]; 4]; RPMAX];
+                    tile_scalar(1, int4, &act.q[p * 2 * k..], &act.s[p * ng * 4..], &q.w[jp * pb..], &q.s[jp * ng * 8..], k, g, &mut t);
+                    for pp in 0..4 {
+                        for (l, &(ri, oi)) in MMLA_LANES.iter().enumerate() {
+                            let (r, o) = (2 * p + ri, jp * 8 + 2 * pp + oi);
+                            if r < m && o < n {
+                                want[r * n + o] = t[0][pp][l] + bias[o];
+                            }
+                        }
+                    }
+                }
+            }
+            let ax = ActX::new(&a, m, k, g);
+            let np = n.div_ceil(8);
+            let mut init = vec![0f32; np * 8];
+            init[..n].copy_from_slice(&bias);
+            for &kern in &kerns {
+                let mut got = vec![0f32; m * n];
+                x86::int(kern, &q, &ax, &init, 0, np, n, &mut got, n);
+                for i in 0..m * n {
+                    assert_eq!(got[i].to_bits(), want[i].to_bits(), "{kern:?} m{m} n{n} k{k} g{g} int4 {int4} [{i}]: {} vs {}", got[i], want[i]);
+                }
+            }
+        }
+    }
+
+    /// x86-64 activation codes are `quant8`'s, ties (half away from zero) and signed zeros included.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[allow(unsafe_code)]
+    fn x86_act_codes() {
+        let mut seed = 21;
+        // max 127: inv 1, so v * inv is v exactly
+        let mut a: Vec<f32> = vec![127.0, -0.0, 0.5, -0.5, 1.5, -1.5, 2.5, -2.5, 126.5, -126.5, 0.49999997, -0.49999997, 3.0, -127.0, 0.0, 64.5];
+        a.extend((0..48).map(|_| rnd(&mut seed) * 127.0));
+        let ax = ActX::new(&a, 1, 64, 16);
+        for c in 0..4 {
+            let x = &a[c * 16..(c + 1) * 16];
+            let max = absmax(x);
+            let inv = if max > 0.0 { 127.0 / max } else { 0.0 };
+            let mut want = [0i8; 16];
+            quant8(&x[..8], inv, &mut want[..8]);
+            quant8(&x[8..], inv, &mut want[8..]);
+            assert_eq!(&ax.q[c * 16..(c + 1) * 16], &want, "group {c}");
+            assert_eq!(ax.sum[c], want.iter().map(|&v| v as i32).sum::<i32>());
+        }
+        // both x86 routines against `quant8` per group: codes, sums, scales
+        for &(m, k, g) in &[(1, 64, 16), (3, 384, 64), (5, 512, 512), (2, 96, 32), (4, 1152, 1152)] {
+            let a: Vec<f32> = (0..m * k).map(|i| if i % 37 == 5 { 0.0 } else if i % 41 == 7 { -0.0 } else { rnd(&mut seed) * if i % 3 == 0 { 0.01 } else { 4.0 } }).collect();
+            let ng = k / g;
+            for lvl in [X86::Avx2, X86::Avx512] {
+                if x86() < lvl {
+                    continue;
+                }
+                let (mut q, mut s, mut sum) = (vec![0i8; m * k], vec![0f32; m * ng], vec![0i32; m * ng]);
+                unsafe {
+                    if lvl == X86::Avx512 { x86::act_avx512(&a, m, k, g, &mut q, &mut s, &mut sum) } else { x86::act_avx2(&a, m, k, g, &mut q, &mut s, &mut sum) }
+                }
+                for i in 0..m * ng {
+                    let x = &a[i * g..(i + 1) * g];
+                    let max = absmax(x);
+                    let inv = if max > 0.0 { 127.0 / max } else { 0.0 };
+                    let mut want = vec![0i8; g];
+                    for (o, x) in want.chunks_exact_mut(8).zip(x.chunks_exact(8)) {
+                        quant8(x, inv, o);
+                    }
+                    assert_eq!(&q[i * g..(i + 1) * g], &want[..], "{lvl:?} m{m} k{k} g{g} group {i}");
+                    assert_eq!(sum[i], want.iter().map(|&v| v as i32).sum::<i32>());
+                    assert_eq!(s[i].to_bits(), (max / 127.0).to_bits());
+                }
+            }
+        }
+    }
+
+    /// `exp` gives the bits of its plain form (floor, then a float -> int cast) over the whole range.
+    #[test]
+    #[allow(clippy::approx_constant)] // the polynomial's coefficients, as in `exp`
+    fn exp_same_bits() {
+        let plain = |x: f32| {
+            let t = (x * core::f32::consts::LOG2_E).clamp(-126.0, 126.0);
+            let i = t.floor();
+            let f = t - i;
+            let p = 1.0 + f * (0.693_147_2 + f * (0.240_226_5 + f * (0.055_504_11 + f * (0.009_618_129 + f * 0.001_333_355))));
+            f32::from_bits(((i as i32 + 127) as u32) << 23) * p
+        };
+        let mut seed = 9;
+        let special = [0.0, -0.0, 1.0, -1.0, 87.0, -87.0, 88.7, -88.0, 1e30, -1e30, f32::MAX, f32::MIN, f32::MIN_POSITIVE, -f32::MIN_POSITIVE, 1e-40, f32::INFINITY, f32::NEG_INFINITY];
+        let xs = special.into_iter().chain((0..2_000_000).map(|i| if i % 2 == 0 { rnd(&mut seed) * 100.0 } else { f32::from_bits((i as u32).wrapping_mul(2_654_435_761)) }));
+        for x in xs {
+            if x.is_nan() {
+                continue;
+            }
+            assert_eq!(exp(x).to_bits(), plain(x).to_bits(), "{x}");
+        }
+    }
+
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn swoosh_neon_matches_scalar() {
@@ -1605,6 +3010,77 @@ mod tests {
             }
         }
         d
+    }
+
+    /// Every x86-64 level gives the bits of the plain Rust (float micro-kernels, integer panels widened).
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
+    #[test]
+    #[allow(unsafe_code)]
+    fn x86_levels_same_bits() {
+        let mut seed = 5;
+        let lvl = x86();
+        for &(m, k) in &[(1, 16), (5, 64), (13, 512), (64, 96), (7, 1536), (30, 48)] {
+            let a: Vec<f32> = (0..m * k).map(|_| rnd(&mut seed)).collect();
+            let panel: Vec<f32> = (0..k * NR).map(|_| rnd(&mut seed)).collect();
+            let init: [f32; NR] = core::array::from_fn(|_| rnd(&mut seed));
+            for cols in [16, 5] {
+                let stride = 21;
+                let mut want = vec![0f32; m * stride];
+                rows(&a, k, &panel, &init, &mut want, stride, cols);
+                let mut got = vec![0f32; m * stride];
+                if lvl >= X86::Avx2 {
+                    unsafe { x86::rows_avx2(&a, k, &panel, &init, &mut got, stride, cols) };
+                    assert!(got == want, "avx2 m{m} k{k}");
+                }
+                if lvl >= X86::Avx512 {
+                    got.fill(0.0);
+                    unsafe { x86::rows_avx512(&a, k, &panel, &init, &mut got, stride, cols) };
+                    assert!(got == want, "avx512 m{m} k{k}");
+                }
+            }
+        }
+        // integer weights widened in registers: the bits of the f32 panels
+        for &(m, n, k, g, int4) in &[(1, 8, 64, 64, true), (5, 19, 128, 64, true), (16, 40, 512, 64, true), (3, 13, 512, 512, false), (8, 24, 96, 32, false), (2, 7, 32, 16, true), (11, 1536, 256, 128, true)] {
+            let codes: Vec<i8> = (0..n * k).map(|_| (rnd(&mut seed) * if int4 { 8.0 } else { 127.0 }).floor().clamp(if int4 { -8.0 } else { -127.0 }, if int4 { 7.0 } else { 127.0 }) as i8).collect();
+            let scales: Vec<f32> = (0..n * k / g).map(|_| 0.01 + rnd(&mut seed).abs() * 0.05).collect();
+            let q = Quant::new(n, k, g, int4, |j, p| codes[j * k + p], |j, c| scales[j * (k / g) + c]);
+            let a: Vec<f32> = (0..m * k).map(|_| rnd(&mut seed)).collect();
+            let bias: Vec<f32> = (0..n).map(|_| rnd(&mut seed)).collect();
+            let mut want = vec![0f32; m * n];
+            blocked(&a, &q, Some(&bias), &mut want);
+            let np = n.div_ceil(8);
+            let mut init = vec![0f32; np.div_ceil(2) * 16];
+            init[..n].copy_from_slice(&bias);
+            let w = np.div_ceil(2) * 16;
+            for l in [X86::Avx2, X86::Avx512] {
+                if lvl < l {
+                    continue;
+                }
+                let mut o = vec![0f32; m * w];
+                unsafe {
+                    if l == X86::Avx2 { x86::quant_avx2(&q, &a, m, &init, 0, np, &mut o, w) } else { x86::quant_avx512(&q, &a, m, &init, 0, np, &mut o, w) }
+                }
+                for r in 0..m {
+                    assert!(o[r * w..r * w + n] == want[r * n..(r + 1) * n], "{l:?} m{m} n{n} k{k} g{g} int4 {int4}");
+                }
+            }
+            if lvl >= X86::Avx2 && m <= SMALL && path() == Path::F32 {
+                assert!(q.gemm(&a, m, Some(&bias)) == want, "gemm_small m{m} n{n}");
+            }
+        }
+        for &(k, g, int4) in &[(64, 64, true), (512, 32, true), (96, 32, false), (512, 512, false), (16, 16, true)] {
+            let w: Vec<u8> = (0..k * 8).map(|_| (rnd(&mut seed) * 1000.0) as i32 as u8).collect();
+            let s: Vec<f32> = (0..k / g * 8).map(|_| rnd(&mut seed)).collect();
+            for c0 in [0, 8] {
+                let mut want = vec![0f32; k * NR];
+                widen8_plain(int4, &w, &s, k, g, &mut want, c0);
+                if lvl >= X86::Avx2 {
+                    let mut got = vec![0f32; k * NR];
+                    unsafe { x86::widen8(int4, &w, &s, k, g, &mut got, c0) };
+                    assert!(got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()), "widen8 k{k} g{g} int4 {int4}");
+                }
+            }
+        }
     }
 
     #[test]

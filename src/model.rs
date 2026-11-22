@@ -336,7 +336,7 @@ fn swoosh(x: &mut [f32], shift: f32, c: f32) {
         crate::kernels::swoosh4(&mut x[..n], shift, c);
         &mut x[n..]
     };
-    x.iter_mut().for_each(|v| *v = softplus(*v - shift) - 0.08 * *v - c);
+    crate::kernels::map(x, |v| softplus(v - shift) - 0.08 * v - c);
 }
 
 /// BiasNorm: x * exp(log_scale) / rms(x - bias), per row.
@@ -466,7 +466,8 @@ impl AttnWeights {
             for j in 0..tk {
                 kh[j * qd..(j + 1) * qd].copy_from_slice(&k[j * qdim + hh * qd..j * qdim + (hh + 1) * qd]);
             }
-            let sc = gemm(&qh, t, &Packed::from_rows(&kh, tk, qd), None);
+            // into this head's rows of the weights (no copy of its own)
+            crate::kernels::gemm_into(&qh, t, &Packed::from_rows(&kh, tk, qd), None, out);
             // position scores: query i, key j sees relative position row n = t - 1 - i + j; with P_h transposed
             // (pd x np) each query adds pd contiguous runs
             for n in 0..np {
@@ -476,7 +477,6 @@ impl AttnWeights {
             }
             for i in 0..t {
                 let row = &mut out[i * tk..(i + 1) * tk];
-                row.copy_from_slice(&sc[i * tk..(i + 1) * tk]);
                 let n0 = t - 1 - i;
                 for c in 0..pd {
                     let pq = y[i * w + 2 * qdim + hh * pd + c];
@@ -488,11 +488,8 @@ impl AttnWeights {
                     }
                 }
                 let m = row.iter().cloned().fold(f32::MIN, f32::max);
-                let mut s = 0.0;
-                row.iter_mut().for_each(|v| {
-                    *v = exp(*v - m);
-                    s += *v;
-                });
+                crate::kernels::map(row, |v| exp(v - m));
+                let s = row.iter().fold(0.0, |s, v| s + v);
                 let inv = 1.0 / s;
                 row.iter_mut().for_each(|v| *v *= inv);
             }
@@ -514,28 +511,39 @@ fn axpy(y: &mut [f32], w: &[f32], x: &[f32]) {
 const RB: usize = 64;
 
 /// out[c] = init[c] + sum over taps of w_tap[c] * x_tap[c] (in tap order), for every channel; channels in blocks of
-/// 16 held in registers across all taps (the same sums, in the same order, as one axpy per tap).
+/// 64 (then 16) held in registers across all taps (the same sums, in the same order, as one axpy per tap; several
+/// blocks of 16 so the adds are not one dependent chain).
 #[inline(always)]
 fn taps<'a>(out: &mut [f32], init: &[f32], taps: impl Iterator<Item = (&'a [f32], &'a [f32])> + Clone) {
-    let d = out.len();
-    let mut c0 = 0;
-    while c0 + 16 <= d {
-        let mut acc: [f32; 16] = init[c0..c0 + 16].try_into().unwrap();
-        for (w, x) in taps.clone() {
-            let (w, x) = (&w[c0..c0 + 16], &x[c0..c0 + 16]);
-            for l in 0..16 {
+    #[inline(always)]
+    fn block<'a, const B: usize>(out: &mut [f32], init: &[f32], c0: usize, taps: impl Iterator<Item = (&'a [f32], &'a [f32])>) {
+        let mut acc: [f32; B] = init[c0..c0 + B].try_into().unwrap();
+        for (w, x) in taps {
+            let (w, x): (&[f32; B], &[f32; B]) = (w[c0..c0 + B].try_into().unwrap(), x[c0..c0 + B].try_into().unwrap());
+            for l in 0..B {
                 acc[l] += w[l] * x[l];
             }
         }
-        out[c0..c0 + 16].copy_from_slice(&acc);
-        c0 += 16;
+        out[c0..c0 + B].copy_from_slice(&acc);
     }
-    if c0 < d {
-        out[c0..].copy_from_slice(&init[c0..]);
-        for (w, x) in taps {
-            axpy(&mut out[c0..], &w[c0..], &x[c0..]);
+    crate::kernels::vector(#[inline(always)] || {
+        let d = out.len();
+        let mut c0 = 0;
+        while c0 + 64 <= d {
+            block::<64>(out, init, c0, taps.clone());
+            c0 += 64;
         }
-    }
+        while c0 + 16 <= d {
+            block::<16>(out, init, c0, taps.clone());
+            c0 += 16;
+        }
+        if c0 < d {
+            out[c0..].copy_from_slice(&init[c0..]);
+            for (w, x) in taps {
+                axpy(&mut out[c0..], &w[c0..], &x[c0..]);
+            }
+        }
+    });
 }
 
 /// (rows x cols) -> (cols x rows).
@@ -602,12 +610,14 @@ impl NonlinAttn {
         let z = self.inp.apply(x, t);
         let mut xs = vec![0.0; t * hid];
         crate::par::chunks_mut(&mut xs, 64 * hid, t * hid * 16, |b, o| {
-            for (i, row) in o.chunks_exact_mut(hid).enumerate() {
-                let r = &z[(b * 64 + i) * 3 * hid..(b * 64 + i + 1) * 3 * hid];
-                for c in 0..hid {
-                    row[c] = r[hid + c] * tanh(r[c]);
+            crate::kernels::vector(#[inline(always)] || {
+                for (i, row) in o.chunks_exact_mut(hid).enumerate() {
+                    let r = &z[(b * 64 + i) * 3 * hid..(b * 64 + i + 1) * 3 * hid];
+                    for c in 0..hid {
+                        row[c] = r[hid + c] * tanh(r[c]);
+                    }
                 }
-            }
+            });
         });
         let xs = cat_cache(cache, xs);
         let o = weighted(&wts[..t * tk], 1, t, tk, &xs, hid);
@@ -646,11 +656,13 @@ impl Conv {
         crate::par::chunks_mut(&mut g, rb * d, 2 * t * d * d, |b, o| {
             let r = o.len() / d;
             let z = self.inp.apply(&x[b * rb * d..(b * rb + r) * d], r);
-            for (row, z) in o.chunks_exact_mut(d).zip(z.chunks_exact(2 * d)) {
-                for c in 0..d {
-                    row[c] = z[c] * sigmoid(z[d + c]);
+            crate::kernels::vector(#[inline(always)] || {
+                for (row, z) in o.chunks_exact_mut(d).zip(z.chunks_exact(2 * d)) {
+                    for c in 0..d {
+                        row[c] = z[c] * sigmoid(z[d + c]);
+                    }
                 }
-            }
+            });
         });
         // causal part over (left pad or cache) + this input
         let mut pad = match &cache {
@@ -830,27 +842,30 @@ struct Embed {
 const FW: usize = 19; // frequency width after the convolutions
 const C3: usize = 128;
 
-/// 3x3 convolution of a channels-last image (t x f x cin), no time padding, `pf` frequency padding.
+/// 3x3 convolution of a channels-last image (t x f x cin), no time padding, `pf` frequency padding; the output has
+/// `pad` rows of zeros before and after (what the next step wants around it, without a copy).
 /// The front end's 3 convolutions have 1, 8 and 32 input channels: a constant, so the copies of each tap unroll.
-fn conv3(x: &[f32], t: usize, f: usize, cin: usize, lin: &Linear, st: usize, sf: usize, pf: usize) -> (Vec<f32>, usize, usize) {
+#[allow(clippy::too_many_arguments)]
+fn conv3(x: &[f32], t: usize, f: usize, cin: usize, lin: &Linear, st: usize, sf: usize, pf: usize, pad: usize) -> (Vec<f32>, usize, usize) {
     match cin {
-        1 => conv3c::<1>(x, t, f, lin, st, sf, pf),
-        8 => conv3c::<8>(x, t, f, lin, st, sf, pf),
-        32 => conv3c::<32>(x, t, f, lin, st, sf, pf),
+        1 => conv3c::<1>(x, t, f, lin, st, sf, pf, pad),
+        8 => conv3c::<8>(x, t, f, lin, st, sf, pf, pad),
+        32 => conv3c::<32>(x, t, f, lin, st, sf, pf, pad),
         _ => unreachable!("front-end convolution with {cin} input channels"),
     }
 }
 
-fn conv3c<const CIN: usize>(x: &[f32], t: usize, f: usize, lin: &Linear, st: usize, sf: usize, pf: usize) -> (Vec<f32>, usize, usize) {
+#[allow(clippy::too_many_arguments)]
+fn conv3c<const CIN: usize>(x: &[f32], t: usize, f: usize, lin: &Linear, st: usize, sf: usize, pf: usize, pad: usize) -> (Vec<f32>, usize, usize) {
     let cin = CIN;
     let to = (t - 3) / st + 1;
     let fo = (f + 2 * pf - 3) / sf + 1;
     // output time rows per block: about 256 Ki values of im2col at a time
     let tb = ((1 << 18) / (fo * 9 * cin)).max(1);
     let n = lin.n();
-    let mut y = vec![0.0; to * fo * n];
+    let mut y = vec![0.0; (to + 2 * pad) * fo * n];
     // blocks of tb output time rows: one task each
-    crate::par::chunks_mut(&mut y, tb * fo * n, to * fo * 9 * cin * n, |blk, yo| {
+    crate::par::chunks_mut(&mut y[pad * fo * n..(pad + to) * fo * n], tb * fo * n, to * fo * 9 * cin * n, |blk, yo| {
         let (i0, nb) = (blk * tb, yo.len() / (fo * n));
         let mut col = vec![0.0; nb * fo * 9 * cin];
         for i in i0..i0 + nb {
@@ -880,10 +895,13 @@ fn conv3c<const CIN: usize>(x: &[f32], t: usize, f: usize, lin: &Linear, st: usi
 
 impl Embed {
     /// Convolutions up to (not including) ConvNeXt: features (t x 80) -> (t' x 19 x 128), t' = (t - 7) / 2 + 1.
-    fn convs(&self, feats: &[f32], t: usize) -> (Vec<f32>, usize) {
-        let (x, t, f) = conv3(feats, t, 80, 1, &self.c0, 1, 1, 1);
-        let (x, t, f) = conv3(&x, t, f, 8, &self.c1, 2, 2, 0);
-        let (x, t, _) = conv3(&x, t, f, 32, &self.c2, 1, 2, 0);
+    /// `pad` rows of zeros before and after the output.
+    fn convs(&self, feats: &[f32], t: usize, pad: usize) -> (Vec<f32>, usize) {
+        // each output goes once the next convolution has read it
+        let (x0, t, f) = conv3(feats, t, 80, 1, &self.c0, 1, 1, 1, 0);
+        let (x1, t, f) = conv3(&x0, t, f, 8, &self.c1, 2, 2, 0, 0);
+        drop(x0);
+        let (x, t, _) = conv3(&x1, t, f, 32, &self.c2, 1, 2, 0, pad);
         (x, t)
     }
 
@@ -1032,11 +1050,13 @@ impl Lstm {
         let mut g = self.ih.apply(x, 1);
         let r = self.hh.apply(h, 1);
         g.iter_mut().zip(&r).for_each(|(a, b)| *a += b);
-        for j in 0..n {
-            let (i, f, gg, o) = (sigmoid(g[j]), sigmoid(g[n + j]), tanh(g[2 * n + j]), sigmoid(g[3 * n + j]));
-            c[j] = f * c[j] + i * gg;
-            h[j] = o * tanh(c[j]);
-        }
+        crate::kernels::vector(#[inline(always)] || {
+            for j in 0..n {
+                let (i, f, gg, o) = (sigmoid(g[j]), sigmoid(g[n + j]), tanh(g[2 * n + j]), sigmoid(g[3 * n + j]));
+                c[j] = f * c[j] + i * gg;
+                h[j] = o * tanh(c[j]);
+            }
+        });
     }
 }
 
@@ -1136,7 +1156,7 @@ pub struct LangInfo {
 }
 
 impl LangInfo {
-    fn new(code: &str) -> LangInfo {
+    pub(crate) fn new(code: &str) -> LangInfo {
         LangInfo { code: code.into(), code0: format!("{code}\0"), full_stop: '.', quotes: None, own: String::new(), syllables: false }
     }
 }
@@ -1490,12 +1510,14 @@ impl Model {
 
     /// Full-context encoder output (frames at 25 Hz x 512) for fbank features (t x 80).
     pub fn encode_full(&self, feats: &[f32], t: usize, lang: usize) -> (Vec<f32>, usize) {
-        let (x, tc) = self.embed.convs(feats, t);
-        let row = FW * C3;
-        let mut rows = vec![0.0; (tc + 6) * row];
-        rows[3 * row..(3 + tc) * row].copy_from_slice(&x);
-        let x = self.embed.convnext(&rows, tc + 6);
-        let mut e = self.embed.finish(&x, tc);
+        // the front end's buffers (each t x 19 x 128) go as soon as they are used, before the encoder runs
+        let (mut e, tc) = {
+            // with ConvNeXt's 3 rows of zero context on each side
+            let (rows, tc) = self.embed.convs(feats, t, 3);
+            let x = self.embed.convnext(&rows, tc + 6);
+            drop(rows);
+            (self.embed.finish(&x, tc), tc)
+        };
         let lv = &self.lang_vec[lang];
         e.chunks_exact_mut(lv.len()).for_each(|r| add(r, lv));
         self.encode(e, tc, None, &[])
@@ -1558,11 +1580,14 @@ impl Model {
             g.iter_mut().zip(&r).for_each(|(a, b)| *a += b);
             for (b, dec) in decs.iter_mut().enumerate() {
                 let g = &g[b * 4 * hn..(b + 1) * 4 * hn];
-                for j in 0..hn {
-                    let (i, f, gg, o) = (sigmoid(g[j]), sigmoid(g[hn + j]), tanh(g[2 * hn + j]), sigmoid(g[3 * hn + j]));
-                    dec.c[j] = f * dec.c[j] + i * gg;
-                    dec.h[j] = o * tanh(dec.c[j]);
-                }
+                let (c, h) = (&mut dec.c, &mut dec.h);
+                crate::kernels::vector(#[inline(always)] || {
+                    for j in 0..hn {
+                        let (i, f, gg, o) = (sigmoid(g[j]), sigmoid(g[hn + j]), tanh(g[2 * hn + j]), sigmoid(g[3 * hn + j]));
+                        c[j] = f * c[j] + i * gg;
+                        h[j] = o * tanh(c[j]);
+                    }
+                });
             }
             let mut hs = Vec::with_capacity(n * hn);
             decs.iter().for_each(|dec| hs.extend_from_slice(&dec.h));
@@ -1581,7 +1606,10 @@ impl Model {
         let jd = self.joiner.enc.n();
         let mut h = Vec::with_capacity(decs.len() * jd);
         for dec in decs {
-            h.extend((0..jd).map(|k| tanh(ep[i * jd + k] + dec.out[k])));
+            let at = h.len();
+            h.resize(at + jd, 0.0);
+            let (hr, e) = (&mut h[at..], &ep[i * jd..(i + 1) * jd]);
+            crate::kernels::vector(#[inline(always)] || hr.iter_mut().zip(e).zip(&dec.out).for_each(|((v, e), o)| *v = tanh(e + o)));
         }
         h
     }
@@ -1628,16 +1656,15 @@ impl Model {
         for i in 0..t {
             // up to max_symbols() tokens per 40 ms frame (fast speech needs more than one)
             for _ in 0..max_symbols() {
-                for (k, v) in h.iter_mut().enumerate() {
-                    *v = tanh(ep[i * jd + k] + dec.out[k]);
-                }
+                let e = &ep[i * jd..(i + 1) * jd];
+                crate::kernels::vector(#[inline(always)] || h.iter_mut().zip(e).zip(&dec.out).for_each(|((v, e), o)| *v = tanh(e + o)));
                 let logit = out.apply(&h, 1);
                 let (best, &m) = logit.iter().enumerate().fold((0, &f32::MIN), |a, b| if b.1 > a.1 { b } else { a });
                 let id = ids[best];
                 if id == 0 {
                     break;
                 }
-                let lse = m + logit.iter().map(|v| exp(v - m)).sum::<f32>().ln();
+                let lse = crate::kernels::log_sum_exp(&logit, m);
                 toks.push(Token { id, frame: frame0 + i as u32, logp: m - lse });
                 self.advance(dec, id);
             }
@@ -1661,7 +1688,7 @@ impl Model {
             for (hi, hy) in hyps.iter().enumerate() {
                 let logit = &lg[hi * vn..(hi + 1) * vn];
                 let m = logit.iter().cloned().fold(f32::MIN, f32::max);
-                let lse = m + logit.iter().map(|v| exp(v - m)).sum::<f32>().ln();
+                let lse = crate::kernels::log_sum_exp(logit, m);
                 for (k, &v) in logit.iter().enumerate() {
                     cand.push((hy.logp + v - lse, hi, k, v - lse));
                 }
@@ -1698,7 +1725,7 @@ impl Model {
         let (out, ids) = &self.joiner.out[lang];
         let lsm = |v: &[f32]| {
             let m = v.iter().cloned().fold(f32::MIN, f32::max);
-            let lse = m + v.iter().map(|x| exp(x - m)).sum::<f32>().ln();
+            let lse = crate::kernels::log_sum_exp(v, m);
             v.iter().map(|x| x - lse).collect::<Vec<f32>>()
         };
         let same = |a: &Hyp, b: &Hyp| a.toks.len() == b.toks.len() && a.toks.iter().zip(&b.toks).all(|(x, y)| x.id == y.id);
@@ -1805,9 +1832,8 @@ impl Model {
         let argmax = |v: &[f32], from: usize| (from..v.len()).fold(from, |a, j| if v[j] > v[a] { j } else { a });
         let mut i = dec.skip;
         while i < t {
-            for (k, v) in h.iter_mut().enumerate() {
-                *v = tanh(ep[i * jd + k] + dec.out[k]);
-            }
+            let e = &ep[i * jd..(i + 1) * jd];
+            crate::kernels::vector(#[inline(always)] || h.iter_mut().zip(e).zip(&dec.out).for_each(|((v, e), o)| *v = tanh(e + o)));
             let logit = out.apply(&h, 1);
             let dl = dur.apply(&h, 1);
             let best = argmax(&logit, 0);
@@ -1819,7 +1845,7 @@ impl Model {
             } else {
                 d = argmax(&dl, 0);
                 let m = logit[best];
-                let lse = m + logit.iter().map(|v| exp(v - m)).sum::<f32>().ln();
+                let lse = crate::kernels::log_sum_exp(&logit, m);
                 toks.push(Token { id, frame: frame0 + i as u32, logp: m - lse });
                 self.advance(dec, id);
                 dec.run = if d == 0 { dec.run + 1 } else { 0 };
@@ -1836,8 +1862,11 @@ impl Model {
 
 
     /// Second pass: full-context transcription of a finished segment (16 kHz); beam > 1: beam search of that width
-    /// (RNN-T: modified_beam_search; TDT: over tokens and durations), else greedy.
-    pub fn full(&self, audio: &[f32], lang: usize, beam: usize) -> Vec<Token> {
+    /// (RNN-T: modified_beam_search; TDT: over tokens and durations), else greedy. `serial_dec`: the search runs on
+    /// this thread alone (the encoder still on all): its steps are small, and the other threads sleep through it
+    /// instead of spinning between them (live re-decodes on a phone: ~10% fewer cycles, words ~7 ms later). The same
+    /// results either way.
+    pub fn full(&self, audio: &[f32], lang: usize, beam: usize, serial_dec: bool) -> Vec<Token> {
         let fb = Fbank::new();
         let t = Fbank::num_frames(audio.len());
         if t < 16 {
@@ -1845,16 +1874,19 @@ impl Model {
         }
         let feats = fb.frames(audio, 0, t);
         let (enc, te) = self.encode_full(&feats, t, lang);
-        if beam > 1 {
-            if let Some(dur) = &self.dur {
-                return self.beam_tdt(dur, &enc, te, lang, beam);
+        let search = || {
+            if beam > 1 {
+                if let Some(dur) = &self.dur {
+                    return self.beam_tdt(dur, &enc, te, lang, beam);
+                }
+                let mut hyps = self.start_beam();
+                self.beam_rnnt(&enc, te, lang, &mut hyps, 0, beam);
+                return Model::best(&hyps);
             }
-            let mut hyps = self.start_beam();
-            self.beam_rnnt(&enc, te, lang, &mut hyps, 0, beam);
-            return Model::best(&hyps);
-        }
-        let mut dec = Decoding::new(self);
-        self.greedy(&enc, te, lang, &mut dec, 0)
+            let mut dec = Decoding::new(self);
+            self.greedy(&enc, te, lang, &mut dec, 0)
+        };
+        if serial_dec { crate::par::serial(search) } else { search() }
     }
 
     /// Second pass + P(the speaker has finished) from the end-of-turn head (None if the file has no head): the last
@@ -2037,7 +2069,7 @@ impl<'m> Stream<'m> {
     fn chunk(&mut self, feats: &[f32]) -> Vec<Token> {
         let m = self.m;
         let win = self.window();
-        let (x, tc) = m.embed.convs(feats, win);
+        let (x, tc) = m.embed.convs(feats, win, 0);
         let row = FW * C3;
         let mut rows = core::mem::take(&mut self.embed_cache);
         rows.extend_from_slice(&x);
