@@ -15,6 +15,7 @@ use alloc::vec::Vec;
 #[cfg(not(feature = "std"))]
 use crate::compat::F32Ext;
 use crate::fbank::{BINS, Fbank};
+use crate::pool::{copy, give, zeros};
 use crate::kernels::{Linear, Packed, Quant, QuantF, Weight, exp, gemm, ln, sigmoid, tanh};
 use alloc::format;
 
@@ -377,6 +378,7 @@ fn add_rows(x: &mut [f32], t: usize, work: usize, f: impl Fn(&[f32], usize, usiz
     crate::par::chunks_mut(x, rb * d, work, |b, xo| {
         let y = f(xo, b * rb, xo.len() / d);
         add(xo, &y);
+        give(y);
     });
 }
 
@@ -410,7 +412,9 @@ impl FeedForward {
         add_rows(x, t, 2 * t * k * self.inp.n(), |xb, _, r| {
             let mut h = self.inp.apply(xb, r);
             swoosh_l(&mut h);
-            self.out.apply(&h, r)
+            let o = self.out.apply(&h, r);
+            give(h);
+            o
         });
     }
 }
@@ -446,7 +450,7 @@ impl AttnWeights {
         let y = self.in_proj.apply(x, t);
         let w = y.len() / t;
         let qdim = h * qd;
-        let mut k = vec![0.0; t * qdim];
+        let mut k = zeros(t * qdim);
         for i in 0..t {
             k[i * qdim..(i + 1) * qdim].copy_from_slice(&y[i * w + qdim..i * w + 2 * qdim]);
         }
@@ -455,10 +459,10 @@ impl AttnWeights {
         // projected encodings of relative positions -(left + t - 1) ..= t - 1
         let np = left + 2 * t - 1;
         let p = self.pos.apply(pe, np);
-        let mut out = vec![0.0; h * t * tk];
+        let mut out = zeros(h * t * tk);
         // heads: one task each
         crate::par::chunks_mut(&mut out, t * tk, h * t * tk * (qd + pd), |hh, out| {
-            let (mut qh, mut kh, mut pt) = (vec![0.0; t * qd], vec![0.0; tk * qd], vec![0.0; pd * np]);
+            let (mut qh, mut kh, mut pt) = (zeros(t * qd), zeros(tk * qd), zeros(pd * np));
             // content scores: Q_h (t x qd) K_h^T, as one product
             for i in 0..t {
                 qh[i * qd..(i + 1) * qd].copy_from_slice(&y[i * w + hh * qd..i * w + (hh + 1) * qd]);
@@ -493,7 +497,9 @@ impl AttnWeights {
                 let inv = 1.0 / s;
                 row.iter_mut().for_each(|v| *v *= inv);
             }
+            [qh, kh, pt].into_iter().for_each(give);
         });
+        [y, k, p].into_iter().for_each(give);
         out
     }
 }
@@ -560,23 +566,26 @@ fn transpose(x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
 /// out (t x heads*d): per head, weights (t x tk) times values (tk x heads*d, head slice).
 fn weighted(wts: &[f32], heads: usize, t: usize, tk: usize, v: &[f32], d: usize) -> Vec<f32> {
     let vd = v.len() / tk;
-    let mut out = vec![0.0; t * heads * d];
+    let mut out = zeros(t * heads * d);
     // heads: one task each
     let per_head = crate::par::map(heads, heads * t * tk * d, |hh| {
         // values of this head, transposed (d x tk): the right-hand matrix of W_h (t x tk) V_h
-        let mut vt = vec![0.0; d * tk];
+        let mut vt = zeros(d * tk);
         for j in 0..tk {
             for c in 0..d {
                 vt[c * tk + j] = v[j * vd + hh * d + c];
             }
         }
-        gemm(&wts[hh * t * tk..(hh + 1) * t * tk], t, &Packed::from_rows(&vt, d, tk), None)
+        let o = gemm(&wts[hh * t * tk..(hh + 1) * t * tk], t, &Packed::from_rows(&vt, d, tk), None);
+        give(vt);
+        o
     });
     for (hh, o) in per_head.iter().enumerate() {
         for i in 0..t {
             out[i * heads * d + hh * d..i * heads * d + (hh + 1) * d].copy_from_slice(&o[i * d..(i + 1) * d]);
         }
     }
+    per_head.into_iter().for_each(give);
     out
 }
 
@@ -594,6 +603,8 @@ impl SelfAttn {
         let o = weighted(wts, self.heads, t, tk, &v, d);
         let k = o.len() / t;
         add_rows(x, t, t * k * self.out.n(), |_, r0, r| self.out.apply(&o[r0 * k..(r0 + r) * k], r));
+        give(v);
+        give(o);
     }
 }
 
@@ -608,7 +619,7 @@ impl NonlinAttn {
     fn add_to(&self, x: &mut [f32], t: usize, wts: &[f32], tk: usize, cache: Option<&mut Vec<f32>>) {
         let hid = self.hid;
         let z = self.inp.apply(x, t);
-        let mut xs = vec![0.0; t * hid];
+        let mut xs = zeros(t * hid);
         crate::par::chunks_mut(&mut xs, 64 * hid, t * hid * 16, |b, o| {
             crate::kernels::vector(#[inline(always)] || {
                 for (i, row) in o.chunks_exact_mut(hid).enumerate() {
@@ -622,13 +633,16 @@ impl NonlinAttn {
         let xs = cat_cache(cache, xs);
         let o = weighted(&wts[..t * tk], 1, t, tk, &xs, hid);
         add_rows(x, t, t * hid * self.out.n(), |_, r0, r| {
-            let mut ob = o[r0 * hid..(r0 + r) * hid].to_vec();
+            let mut ob = copy(&o[r0 * hid..(r0 + r) * hid]);
             for (i, row) in ob.chunks_exact_mut(hid).enumerate() {
                 let zr = &z[(r0 + i) * 3 * hid + 2 * hid..(r0 + i + 1) * 3 * hid];
                 row.iter_mut().zip(zr).for_each(|(v, z)| *v *= z);
             }
-            self.out.apply(&ob, r)
+            let y = self.out.apply(&ob, r);
+            give(ob);
+            y
         });
+        [z, xs, o].into_iter().for_each(give);
     }
 }
 
@@ -651,7 +665,7 @@ impl Conv {
         let (d, k) = (self.dim, self.kernel);
         let lp = k / 2;
         // input projection and gate, row blocks: one task each
-        let mut g = vec![0.0; t * d];
+        let mut g = zeros(t * d);
         let rb = crate::par::block_rows(t, RB);
         crate::par::chunks_mut(&mut g, rb * d, 2 * t * d * d, |b, o| {
             let r = o.len() / d;
@@ -663,11 +677,12 @@ impl Conv {
                     }
                 }
             });
+            give(z);
         });
         // causal part over (left pad or cache) + this input
         let mut pad = match &cache {
-            Some(c) => (*c).clone(),
-            None => vec![0.0; lp * d],
+            Some(c) => copy(c),
+            None => zeros(lp * d),
         };
         pad.extend_from_slice(&g);
         if let Some(c) = cache {
@@ -676,7 +691,7 @@ impl Conv {
         let half = lp + 1;
         // depthwise, output projection and the residual, row blocks: one task each
         add_rows(x, t, t * d * (half + k + d), |_, r0, rows| {
-            let mut yo = vec![0.0; rows * d];
+            let mut yo = zeros(rows * d);
             let mut b = vec![0.0; d];
             for i in r0..r0 + rows {
                 let a = &mut yo[(i - r0) * d..(i - r0 + 1) * d];
@@ -693,8 +708,12 @@ impl Conv {
                 }
             }
             swoosh_r(&mut yo);
-            self.out.apply(&yo, rows)
+            let y = self.out.apply(&yo, rows);
+            give(yo);
+            y
         });
+        give(g);
+        give(pad);
     }
 }
 
@@ -726,7 +745,7 @@ struct Layer {
 
 impl Layer {
     fn forward(&self, x: &mut Vec<f32>, t: usize, st: Option<&mut LayerState>, left: usize, masked: &[bool], pe: &[f32]) {
-        let orig = x.clone();
+        let orig = copy(x);
         let tk = left + t;
         let (mut key, mut nl, mut v1, mut v2, mut c1, mut c2) = (None, None, None, None, None, None);
         if let Some(s) = st {
@@ -753,6 +772,8 @@ impl Layer {
             self.norm.apply(xo);
             bypass(&orig[b * rb * d..b * rb * d + xo.len()], xo, &self.bypass);
         });
+        give(orig);
+        give(w);
     }
 }
 
@@ -775,7 +796,7 @@ fn softmax(b: &[f32]) -> Vec<f32> {
 fn downsample(x: &[f32], t: usize, d: usize, w: &[f32]) -> (Vec<f32>, usize) {
     let ds = w.len();
     let dt = t.div_ceil(ds);
-    let mut out = vec![0.0; dt * d];
+    let mut out = zeros(dt * d);
     for i in 0..dt {
         for (k, wk) in w.iter().enumerate() {
             let s = (i * ds + k).min(t - 1);
@@ -796,16 +817,18 @@ impl Stack {
             run(&self.layers, x, t, st, left, &masked, pos_dim);
             return;
         }
-        let orig = x.clone();
+        let orig = copy(x);
         let (mut y, dt) = downsample(x, t, d, &self.down);
         masked.resize(left + dt, false);
         run(&self.layers, &mut y, dt, st, left, &masked, pos_dim);
-        let mut up = vec![0.0; t * d];
+        let mut up = zeros(t * d);
         for i in 0..t {
             up[i * d..(i + 1) * d].copy_from_slice(&y[(i / self.ds) * d..(i / self.ds + 1) * d]);
         }
         bypass(&orig, &mut up, &self.combine);
-        *x = up;
+        give(core::mem::replace(x, up));
+        give(orig);
+        give(y);
     }
 }
 
@@ -863,11 +886,11 @@ fn conv3c<const CIN: usize>(x: &[f32], t: usize, f: usize, lin: &Linear, st: usi
     // output time rows per block: about 256 Ki values of im2col at a time
     let tb = ((1 << 18) / (fo * 9 * cin)).max(1);
     let n = lin.n();
-    let mut y = vec![0.0; (to + 2 * pad) * fo * n];
+    let mut y = zeros((to + 2 * pad) * fo * n);
     // blocks of tb output time rows: one task each
     crate::par::chunks_mut(&mut y[pad * fo * n..(pad + to) * fo * n], tb * fo * n, to * fo * 9 * cin * n, |blk, yo| {
         let (i0, nb) = (blk * tb, yo.len() / (fo * n));
-        let mut col = vec![0.0; nb * fo * 9 * cin];
+        let mut col = zeros(nb * fo * 9 * cin);
         for i in i0..i0 + nb {
             for j in 0..fo {
                 let row = &mut col[((i - i0) * fo + j) * 9 * cin..((i - i0) * fo + j + 1) * 9 * cin];
@@ -889,6 +912,8 @@ fn conv3c<const CIN: usize>(x: &[f32], t: usize, f: usize, lin: &Linear, st: usi
         let mut yb = lin.apply(&col, nb * fo);
         swoosh_r(&mut yb);
         yo.copy_from_slice(&yb);
+        give(col);
+        give(yb);
     });
     (y, to, fo)
 }
@@ -900,8 +925,9 @@ impl Embed {
         // each output goes once the next convolution has read it
         let (x0, t, f) = conv3(feats, t, 80, 1, &self.c0, 1, 1, 1, 0);
         let (x1, t, f) = conv3(&x0, t, f, 8, &self.c1, 2, 2, 0, 0);
-        drop(x0);
+        give(x0);
         let (x, t, _) = conv3(&x1, t, f, 32, &self.c2, 1, 2, 0, pad);
+        give(x1);
         (x, t)
     }
 
@@ -911,11 +937,11 @@ impl Embed {
         let t = t_in - 6;
         let row = FW * C3;
         let tb = (RB / FW).max(1); // time rows per block (x 19 frequency rows each): one task each
-        let mut z = vec![0.0; t * row];
+        let mut z = zeros(t * row);
         let work = t * FW * (2 * C3 * self.pw1.n() + 49 * C3);
         crate::par::chunks_mut(&mut z, tb * row, work, |blk, zo| {
             let (i0, nb) = (blk * tb, zo.len() / row);
-            let mut y = vec![0.0; nb * row];
+            let mut y = zeros(nb * row);
             for i in i0..i0 + nb {
                 for f in 0..FW {
                     let a = &mut y[(i - i0) * row + f * C3..(i - i0) * row + (f + 1) * C3];
@@ -932,6 +958,7 @@ impl Embed {
             let mut zb = self.pw2.apply(&h, nb * FW);
             add(&mut zb, &rows[(3 + i0) * row..(3 + i0 + nb) * row]);
             zo.copy_from_slice(&zb);
+            [y, h, zb].into_iter().for_each(give);
         });
         z
     }
@@ -1473,17 +1500,17 @@ impl Model {
         for (s, st) in self.stacks.iter().enumerate() {
             if st.dim != cd {
                 // convert_num_channels: truncate or zero-pad to this stack's width
-                let mut y = vec![0.0; t * st.dim];
+                let mut y = zeros(t * st.dim);
                 let m = st.dim.min(cd);
                 for i in 0..t {
                     y[i * st.dim..i * st.dim + m].copy_from_slice(&cur[i * cd..i * cd + m]);
                 }
-                cur = y;
+                give(core::mem::replace(&mut cur, y));
                 cd = st.dim;
             }
             let ls = states.as_deref_mut().map(|all| &mut all[s][..]);
             st.forward(&mut cur, t, ls, left, masked, self.pos_dim);
-            outs.push(cur.clone());
+            outs.push(copy(&cur));
         }
         // full-dim output: the last stack, then the extra channels of earlier, wider stacks
         let last = self.stacks.len() - 1;
@@ -1496,7 +1523,7 @@ impl Model {
                 od = d;
             }
         }
-        let mut full = vec![0.0; t * od];
+        let mut full = zeros(t * od);
         for i in 0..t {
             let mut o = 0;
             for &(s, a, b) in &pieces {
@@ -1505,7 +1532,11 @@ impl Model {
                 o += b - a;
             }
         }
-        downsample(&full, t, od, &self.out_down)
+        let r = downsample(&full, t, od, &self.out_down);
+        give(full);
+        give(cur);
+        outs.into_iter().for_each(give);
+        r
     }
 
     /// Full-context encoder output (frames at 25 Hz x 512) for fbank features (t x 80).
@@ -1867,24 +1898,35 @@ impl Model {
     /// instead of spinning between them (live re-decodes on a phone: ~10% fewer cycles, words ~7 ms later). The same
     /// results either way.
     pub fn full(&self, audio: &[f32], lang: usize, beam: usize, serial_dec: bool) -> Vec<Token> {
-        let fb = Fbank::new();
+        match self.encode_audio(audio, lang) {
+            Some((enc, te)) => self.search(&enc, te, lang, beam, serial_dec),
+            None => Vec::new(),
+        }
+    }
+
+    /// The full-context encoder output of `audio` (frames at 25 Hz x 512, their count); None if it is too short.
+    pub fn encode_audio(&self, audio: &[f32], lang: usize) -> Option<(Vec<f32>, usize)> {
         let t = Fbank::num_frames(audio.len());
         if t < 16 {
-            return Vec::new();
+            return None;
         }
-        let feats = fb.frames(audio, 0, t);
-        let (enc, te) = self.encode_full(&feats, t, lang);
+        let feats = Fbank::new().frames(audio, 0, t);
+        Some(self.encode_full(&feats, t, lang))
+    }
+
+    /// The decoding of an encoder output (`te` frames): beam search, or greedy for `beam` 1.
+    pub fn search(&self, enc: &[f32], te: usize, lang: usize, beam: usize, serial_dec: bool) -> Vec<Token> {
         let search = || {
             if beam > 1 {
                 if let Some(dur) = &self.dur {
-                    return self.beam_tdt(dur, &enc, te, lang, beam);
+                    return self.beam_tdt(dur, enc, te, lang, beam);
                 }
                 let mut hyps = self.start_beam();
-                self.beam_rnnt(&enc, te, lang, &mut hyps, 0, beam);
+                self.beam_rnnt(enc, te, lang, &mut hyps, 0, beam);
                 return Model::best(&hyps);
             }
             let mut dec = Decoding::new(self);
-            self.greedy(&enc, te, lang, &mut dec, 0)
+            self.greedy(enc, te, lang, &mut dec, 0)
         };
         if serial_dec { crate::par::serial(search) } else { search() }
     }
@@ -1892,17 +1934,23 @@ impl Model {
     /// Second pass + P(the speaker has finished) from the end-of-turn head (None if the file has no head): the last
     /// HEAD_K encoder frames and the decoder output after the last text tokens (<eou>, id 12, skipped).
     pub fn full_head(&self, audio: &[f32], lang: usize) -> (Vec<Token>, Option<f32>) {
-        let fb = Fbank::new();
-        let t = Fbank::num_frames(audio.len());
-        if t < 16 {
+        match self.encode_audio(audio, lang) {
+            Some((enc, te)) => self.head_on(&enc, te, lang),
+            None => (Vec::new(), None),
+        }
+    }
+
+    /// `full_head` on an encoder output (`te` frames): greedy tokens, P(the speaker has finished). The output can then
+    /// be decoded with `search` too (`file.rs`).
+    pub fn head_on(&self, enc: &[f32], te: usize, lang: usize) -> (Vec<Token>, Option<f32>) {
+        if te == 0 {
             return (Vec::new(), None);
         }
-        let feats = fb.frames(audio, 0, t);
-        let (enc, te) = self.encode_full(&feats, t, lang);
+        let d = self.stacks.iter().map(|s| s.dim).max().unwrap_or(0);
+        let enc = &enc[..te * d];
         let mut dec = Decoding::new(self);
-        let toks = self.greedy(&enc, te, lang, &mut dec, 0);
+        let toks = self.greedy(enc, te, lang, &mut dec, 0);
         let p = self.head.as_ref().map(|h| {
-            let d = enc.len() / te.max(1);
             let n = te.min(HEAD_K);
             let mut last = vec![0.0; HEAD_K * d];
             last[(HEAD_K - n) * d..].copy_from_slice(&enc[(te - n) * d..te * d]);

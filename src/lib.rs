@@ -45,6 +45,7 @@ mod file;
 mod no_std_runtime;
 mod onnx;
 mod par;
+mod pool;
 mod session;
 mod text;
 mod vad;
@@ -148,9 +149,11 @@ impl Models {
     /// Runs `body` with this instance's threads.
     fn with_threads<R>(&self, body: impl FnOnce() -> R) -> R {
         #[cfg(feature = "std")]
-        return par::enter(self.exec.as_ref(), body);
+        let r = par::enter(self.exec.as_ref(), body);
         #[cfg(not(feature = "std"))]
-        body()
+        let r = body();
+        pool::clear(); // the pass's temporary buffers
+        r
     }
 
     /// The languages of the recognizer: the codes its file names, in its order.

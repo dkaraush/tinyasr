@@ -160,6 +160,12 @@ fn lag() -> f64 {
     LAG
 }
 
+/// The word was decoded from audio that stops at `t` (s), sooner after its sound than the model's delay: its last
+/// emission came early, so it counts as written at the audio's end (`spans` then ends it with the speech).
+pub fn heard_until(w: &mut W, t: f64) {
+    w.tw = w.tw.max(t + lag() - 0.04);
+}
+
 /// How late the transducer writes a word after its sound (s): measured on FLEURS against the speech's own starts and ends.
 const LAG: f64 = 0.32;
 

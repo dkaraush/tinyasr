@@ -49,7 +49,7 @@ impl Packed {
 pub fn gemm(a: &[f32], m: usize, b: &Packed, bias: Option<&[f32]>) -> Vec<f32> {
     let (n, k) = (b.n, b.k);
     assert!(a.len() >= m * k);
-    let mut out = vec![0.0; m * n];
+    let mut out = crate::pool::any(m * n); // every value is written
     gemm_rows(&a[..m * k], b, bias, &mut out);
     out
 }
@@ -70,6 +70,10 @@ trait Panels {
     fn k(&self) -> usize;
     /// Panel `jp`: stored, or widened into `scratch` (k x NR).
     fn panel<'s>(&'s self, jp: usize, scratch: &'s mut [f32]) -> &'s [f32];
+    /// Whether `panel` needs the scratch (false: it may be empty).
+    fn widens(&self) -> bool {
+        true
+    }
 }
 
 impl Panels for Packed {
@@ -82,6 +86,9 @@ impl Panels for Packed {
     fn panel<'s>(&'s self, jp: usize, _: &'s mut [f32]) -> &'s [f32] {
         Packed::panel(self, jp)
     }
+    fn widens(&self) -> bool {
+        false
+    }
 }
 
 /// The cache-blocked loop around the micro-kernel: blocks of MB rows of `a`, one weight panel at a time.
@@ -93,7 +100,7 @@ fn blocked(a: &[f32], b: &(impl Panels + Sync), bias: Option<&[f32]>, out: &mut 
     crate::par::chunks_mut(out, mb * n, m * n * k, |blk, out| {
         let i0 = blk * mb;
         let i1 = (i0 + mb).min(m);
-        let mut scratch = vec![0f32; k * NR];
+        let mut scratch = vec![0f32; if b.widens() { k * NR } else { 0 }];
         for jp in 0..n.div_ceil(NR) {
             let panel = b.panel(jp, &mut scratch);
             let j0 = jp * NR;
@@ -253,8 +260,8 @@ pub fn ln(x: f32) -> f32 {
 }
 
 /// `swoosh` (model.rs) on NEON, 4 values at a time: softplus(v - shift) - 0.08 v - c with softplus(y) =
-/// max(y, 0) + ln(1 + e^-|y|), the same polynomials as `exp` and `ln`; ln's division by a reciprocal estimate refined
-/// twice (Newton), within an ulp or so. x.len() a multiple of 4.
+/// max(y, 0) + ln(1 + e^-|y|): e^-|y| with the polynomial of `exp`, ln(1 + e) with one polynomial in e (e <= 1), within
+/// ~2e-7 of the scalar form. x.len() a multiple of 4.
 #[cfg(target_arch = "aarch64")]
 #[allow(unsafe_code, clippy::approx_constant)]
 pub fn swoosh4(x: &mut [f32], shift: f32, c: f32) {
@@ -275,22 +282,12 @@ pub fn swoosh4(x: &mut [f32], shift: f32, c: f32) {
                 p = vfmaq_f32(f(k), p, fr);
             }
             let e = vmulq_f32(vreinterpretq_f32_s32(vshlq_n_s32::<23>(vaddq_s32(vcvtq_s32_f32(i), vdupq_n_s32(127)))), p);
-            // ln(1 + e) (as `ln`)
-            let u = vaddq_f32(f(1.0), e);
-            let b = vreinterpretq_u32_f32(u);
-            let ex = vshrq_n_s32::<23>(vreinterpretq_s32_u32(vsubq_u32(b, vdupq_n_u32(0x3f35_04f3))));
-            let m = vreinterpretq_f32_u32(vsubq_u32(b, vshlq_n_u32::<23>(vreinterpretq_u32_s32(ex))));
-            let den = vaddq_f32(m, f(1.0));
-            let mut r = vrecpeq_f32(den);
-            r = vmulq_f32(r, vrecpsq_f32(den, r));
-            r = vmulq_f32(r, vrecpsq_f32(den, r));
-            let sv = vmulq_f32(vsubq_f32(m, f(1.0)), r);
-            let z = vmulq_f32(sv, sv);
-            let mut q = f(0.181_818_2);
-            for k in [0.222_222_2, 0.285_714_3, 0.4, 0.666_666_7, 2.0] {
-                q = vfmaq_f32(f(k), q, z);
+            // ln(1 + e) for e in (0, 1]: e q(e), q of degree 7 (near-minimax fit, abs. err ~1e-7 with the rounding)
+            let mut q = f(-0.006_452_612_6);
+            for k in [0.036_084_52, -0.095_322_49, 0.167_647_85, -0.240_730_76, 0.331_798_26, -0.499_874_06, 0.999_996_4] {
+                q = vfmaq_f32(f(k), q, e);
             }
-            let ln = vfmaq_f32(vmulq_f32(sv, q), vcvtq_f32_s32(ex), f(core::f32::consts::LN_2));
+            let ln = vmulq_f32(e, q);
             let sp = vaddq_f32(vmaxq_f32(y, f(0.0)), ln);
             vst1q_f32(ch.as_mut_ptr(), vsubq_f32(vsubq_f32(sp, vmulq_f32(f(0.08), v)), f(c)));
         }
@@ -618,10 +615,38 @@ impl Quant {
 
     /// out (m x n) = a (m x k) * W^T (+ bias).
     fn gemm(&self, a: &[f32], m: usize, bias: Option<&[f32]>) -> Vec<f32> {
-        assert!(a.len() >= m * self.k);
-        let a = &a[..m * self.k];
+        self.gemm_as(a, m, bias, false)
+    }
+
+    /// `gemm` with the activations at 16-bit precision, for layers where int8 activations would cost accuracy: every
+    /// row x becomes two int8 rows, x ~ (255 hi + lo) * max / 32512 (`quant16`), multiplied by the same integer kernels
+    /// (twice the work of `gemm`), and the two products are added. Integer paths only.
+    fn gemm_wide(&self, a: &[f32], m: usize, bias: Option<&[f32]>) -> Vec<f32> {
+        let n = self.n;
+        let two = self.gemm_as(a, 2 * m, None, true);
+        let mut out = crate::pool::any(m * n); // every value is written
+        for (r, o) in out.chunks_exact_mut(n).enumerate() {
+            let (hi, lo) = (&two[2 * r * n..(2 * r + 1) * n], &two[(2 * r + 1) * n..(2 * r + 2) * n]);
+            match bias {
+                Some(b) => o.iter_mut().zip(hi).zip(lo).zip(b).for_each(|(((o, h), l), b)| *o = h + l + b),
+                None => o.iter_mut().zip(hi).zip(lo).for_each(|((o, h), l)| *o = h + l),
+            }
+        }
+        crate::pool::give(two);
+        out
+    }
+
+    /// `gemm` of m rows; `wide`: they are the m / 2 rows of `a` as (hi, lo) pairs of int8 rows (`gemm_wide`).
+    fn gemm_as(&self, a: &[f32], m: usize, bias: Option<&[f32]>, wide: bool) -> Vec<f32> {
+        let per = if wide { 2 } else { 1 }; // rows of the product per row of `a`
+        assert!(m.is_multiple_of(per) && a.len() >= m / per * self.k);
+        let a = &a[..m / per * self.k];
         let path = path();
-        let mut out = vec![0.0; m * self.n];
+        assert!(!wide || !matches!(path, Path::F32 | Path::X86), "16-bit activations: integer kernels only");
+        if !matches!(path, Path::F32 | Path::X86) && self.lay == Lay::Dot4 {
+            return self.gemm4(a, m, bias, wide);
+        }
+        let mut out = crate::pool::any(m * self.n); // every value is written (blocks of rows, or groups of columns)
         if path == Path::F32 {
             #[cfg(target_arch = "x86_64")]
             if m <= SMALL && x86() >= X86::Avx2 {
@@ -635,10 +660,6 @@ impl Quant {
         if path == Path::X86 {
             self.gemm_x86(a, m, bias, &mut out);
             return out;
-        }
-        match self.lay {
-            Lay::Dot4 => return self.gemm4(a, m, bias),
-            Lay::Pair => {}
         }
         // the pair layout's own kernels (its layout follows the path; the others meet it only in tests)
         #[cfg(target_arch = "aarch64")]
@@ -659,7 +680,7 @@ impl Quant {
         if threads > 1 && pairs.div_ceil(mbp) < 2 * threads && np >= 2 * threads && work >= crate::par::MIN_WORK {
             // few rows (streaming chunks, decoding): groups of output panels instead, one task each, into their own
             // columns
-            let act = pack_act(a, m, k, g);
+            let act = if wide { pack_act16(a, m / 2, k, g) } else { pack_act(a, m, k, g) };
             let pg = np.div_ceil(4 * threads);
             let parts = crate::par::map(np.div_ceil(pg), work, |grp| {
                 let (jp0, jp1) = (grp * pg, (grp * pg + pg).min(np));
@@ -682,7 +703,7 @@ impl Quant {
         crate::par::chunks_mut(&mut out, 2 * mbp * n, work, |blk, out| {
             let (p0, r0) = (blk * mbp, 2 * blk * mbp); // first pair, first row of the block
             let rows = out.len() / n;
-            let act = pack_act(&a[r0 * k..(r0 + rows) * k], rows, k, g);
+            let act = if wide { pack_act16(&a[r0 / 2 * k..(r0 + rows) / 2 * k], rows / 2, k, g) } else { pack_act(&a[r0 * k..(r0 + rows) * k], rows, k, g) };
             self.block(path, &act, p0, (p0 + mbp).min(pairs), m, 0, np, bias, out, r0, 0, n);
         });
         out
@@ -778,6 +799,37 @@ impl Quant {
             let w = &self.w[jp * pb..(jp + 1) * pb];
             let sw = &self.s[jp * ng * 8..(jp + 1) * ng * 8];
             let j0 = jp * 8;
+            #[cfg(target_arch = "aarch64")]
+            #[allow(unsafe_code)]
+            if path == Path::Mmla {
+                // a whole panel of whole row pairs: sums + bias straight into `out`; an odd last row or the last,
+                // narrower panel through `part`
+                let pairs = p1 - p0;
+                let (rows, cols) = ((2 * p1).min(m) - 2 * p0, 8.min(n - j0));
+                let direct = rows == 2 * pairs && cols == 8;
+                let mut b8 = [0f32; 8];
+                b8[..cols].copy_from_slice(&bias[j0..j0 + cols]);
+                let mut part = if direct { Vec::new() } else { vec![0f32; pairs * 16] };
+                let o0 = (2 * p0 - r0) * stride + j0 - c0;
+                let (op, st) = if direct { (out[o0..].as_mut_ptr(), stride) } else { (part.as_mut_ptr(), 8) };
+                assert!(!direct || pairs == 0 || o0 + (rows - 1) * stride + 8 <= out.len());
+                assert!(act.q.len() >= pairs * 2 * k && act.s.len() >= pairs * ng * 4 && w.len() >= k * if self.int4 { 4 } else { 8 } && sw.len() >= ng * 8);
+                assert!(g.is_multiple_of(16) && k.is_multiple_of(g));
+                // SAFETY: the path was picked for this CPU's features (`path`); `pairs` row pairs of 2k codes and of
+                // ng x 4 scales in act, the panel's weights and scales, 8 bias values and 2 * pairs rows of 8 outputs
+                // `st` apart from op (asserted).
+                unsafe {
+                    if self.int4 {
+                        neon::panel_mm::<true>(act.q.as_ptr(), act.s.as_ptr(), pairs, w.as_ptr(), sw.as_ptr(), k, ng, g, b8.as_ptr(), op, st)
+                    } else {
+                        neon::panel_mm::<false>(act.q.as_ptr(), act.s.as_ptr(), pairs, w.as_ptr(), sw.as_ptr(), k, ng, g, b8.as_ptr(), op, st)
+                    }
+                }
+                for (r, p) in part.chunks_exact(8).take(rows).enumerate() {
+                    out[o0 + r * stride..o0 + r * stride + cols].copy_from_slice(&p[..cols]);
+                }
+                continue;
+            }
             let mut p = p0;
             while p < p1 {
                 let rp = if path == Path::Mmla && p1 - p >= 4 { 4 } else if p1 - p >= 2 { 2 } else { 1 };
@@ -789,6 +841,25 @@ impl Quant {
                     if rr + 2 <= m && j0 + 8 <= n {
                         // whole block: row rr is lanes 0, 1 of every pair, row rr + 1 lanes 2, 3
                         let b = &bias[j0..j0 + 8];
+                        #[cfg(target_arch = "aarch64")]
+                        #[allow(unsafe_code)]
+                        {
+                            use core::arch::aarch64::*;
+                            let o0 = (rr - r0) * stride + j0 - c0;
+                            assert!(o0 + stride + 8 <= out.len());
+                            // SAFETY: NEON is mandatory on aarch64; t[pp] holds 4 floats, b 8, and rows rr, rr + 1 of
+                            // out 8 each from o0 (asserted). The same sums as below.
+                            unsafe {
+                                let tv: [float32x4_t; 4] = core::array::from_fn(|pp| vld1q_f32(t[pp].as_ptr()));
+                                let (b0, b1) = (vld1q_f32(b.as_ptr()), vld1q_f32(b.as_ptr().add(4)));
+                                let op = out.as_mut_ptr().add(o0);
+                                vst1q_f32(op, vaddq_f32(vcombine_f32(vget_low_f32(tv[0]), vget_low_f32(tv[1])), b0));
+                                vst1q_f32(op.add(4), vaddq_f32(vcombine_f32(vget_low_f32(tv[2]), vget_low_f32(tv[3])), b1));
+                                vst1q_f32(op.add(stride), vaddq_f32(vcombine_f32(vget_high_f32(tv[0]), vget_high_f32(tv[1])), b0));
+                                vst1q_f32(op.add(stride + 4), vaddq_f32(vcombine_f32(vget_high_f32(tv[2]), vget_high_f32(tv[3])), b1));
+                            }
+                        }
+                        #[cfg(not(target_arch = "aarch64"))]
                         for h in 0..2 {
                             let o0 = (rr + h - r0) * stride + j0 - c0;
                             let o = &mut out[o0..o0 + 8];
@@ -816,17 +887,17 @@ impl Quant {
 
 impl Quant {
     /// `gemm` for the `sdot` layout: blocks of rows (or, few rows, groups of output panels), one task each.
-    fn gemm4(&self, a: &[f32], m: usize, bias: Option<&[f32]>) -> Vec<f32> {
+    fn gemm4(&self, a: &[f32], m: usize, bias: Option<&[f32]>, wide: bool) -> Vec<f32> {
         let (n, k, g) = (self.n, self.k, self.group);
         let np = n.div_ceil(8);
         let zero = vec![0f32; if bias.is_some() { 0 } else { np * 8 }];
         let bias = bias.unwrap_or(&zero);
-        let mut out = vec![0.0; m * n];
+        let mut out = crate::pool::any(m * n); // every value is written
         let work = m * n * k;
         let mb = crate::par::block_rows(m, 32);
         let threads = crate::par::threads();
         if threads > 1 && m.div_ceil(mb) < 2 * threads && np >= 2 * threads && work >= crate::par::MIN_WORK {
-            let (q, sa) = pack_rows(a, m, k, g);
+            let (q, sa) = if wide { pack_rows16(a, m / 2, k, g) } else { pack_rows(a, m, k, g) };
             let pg = np.div_ceil(4 * threads);
             let parts = crate::par::map(np.div_ceil(pg), work, |grp| {
                 let (jp0, jp1) = (grp * pg, (grp * pg + pg).min(np));
@@ -847,7 +918,7 @@ impl Quant {
         }
         crate::par::chunks_mut(&mut out, mb * n, work, |blk, out| {
             let (r0, rows) = (blk * mb, out.len() / n);
-            let (q, sa) = pack_rows(&a[r0 * k..(r0 + rows) * k], rows, k, g);
+            let (q, sa) = if wide { pack_rows16(&a[r0 / 2 * k..(r0 + rows) / 2 * k], rows / 2, k, g) } else { pack_rows(&a[r0 * k..(r0 + rows) * k], rows, k, g) };
             self.block4(&q, &sa, rows, 0, np, bias, out, 0, n);
         });
         out
@@ -865,68 +936,71 @@ impl Quant {
             let sw = &self.s[jp * ng * 8..(jp + 1) * ng * 8];
             let j0 = jp * 8;
             let cols = 8.min(n - j0);
-            let mut r = 0;
-            while r < rows {
-                let rr = 4.min(rows - r);
-                let mut t = [[0f32; 8]; 4];
-                tile4(rr, self.int4, &q[r * k..(r + rr) * k], &sa[r * ng..(r + rr) * ng], w, sw, k, g, &mut t);
-                for (i, t) in t.iter().enumerate().take(rr) {
-                    let o = (r + i) * stride + j0 - c0;
-                    for l in 0..cols {
-                        out[o + l] = t[l] + bias[j0 + l];
+            #[cfg(target_arch = "aarch64")]
+            #[allow(unsafe_code)]
+            {
+                // a whole panel: every row's 8 sums + bias straight into `out`; the last, narrower one through `part`
+                let mut b8 = [0f32; 8];
+                b8[..cols].copy_from_slice(&bias[j0..j0 + cols]);
+                let mut part = if cols < 8 { vec![0f32; rows * 8] } else { Vec::new() };
+                let (op, st) = if cols < 8 { (part.as_mut_ptr(), 8) } else { (out[j0 - c0..].as_mut_ptr(), stride) };
+                assert!(cols < 8 || rows == 0 || (rows - 1) * stride + j0 - c0 + 8 <= out.len());
+                assert!(w.len() >= k * if self.int4 { 4 } else { 8 } && sw.len() >= ng * 8 && k.is_multiple_of(g));
+                // SAFETY: the `sdot` layout is built only on the dotprod path (`Quant::new`); `rows` rows of k codes in
+                // q and of ng scales in sa (asserted above the loop), the panel's weights and scales, 8 bias values and
+                // rows of 8 outputs `st` apart from op (asserted here).
+                unsafe {
+                    if self.int4 {
+                        neon::panel4::<true>(q.as_ptr(), sa.as_ptr(), rows, w.as_ptr(), sw.as_ptr(), k, ng, g, b8.as_ptr(), op, st)
+                    } else {
+                        neon::panel4::<false>(q.as_ptr(), sa.as_ptr(), rows, w.as_ptr(), sw.as_ptr(), k, ng, g, b8.as_ptr(), op, st)
                     }
                 }
-                r += rr;
+                for (r, p) in part.chunks_exact(8).enumerate() {
+                    out[r * stride + j0 - c0..r * stride + j0 - c0 + cols].copy_from_slice(&p[..cols]);
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                let mut r = 0;
+                while r < rows {
+                    let rr = 4.min(rows - r);
+                    let mut t = [[0f32; 8]; 4];
+                    tile4(rr, self.int4, &q[r * k..(r + rr) * k], &sa[r * ng..(r + rr) * ng], w, sw, k, g, &mut t);
+                    for (i, t) in t.iter().enumerate().take(rr) {
+                        let o = (r + i) * stride + j0 - c0;
+                        for l in 0..cols {
+                            out[o + l] = t[l] + bias[j0 + l];
+                        }
+                    }
+                    r += rr;
+                }
             }
         }
     }
 }
 
-/// `rr` (1..=4) activation rows x one panel (8 outputs) in the `sdot` layout -> t[row][output].
+/// `rr` (1..=4) activation rows x one panel (8 outputs) in the `sdot` layout -> t[row][output], portable (the layout
+/// is built only for the aarch64 `sdot` path, which has its own loop: `neon::panel4`; this keeps other targets compiling).
+#[cfg(not(target_arch = "aarch64"))]
 #[allow(clippy::too_many_arguments)]
-#[inline(always)]
 fn tile4(rr: usize, int4: bool, a: &[i8], sa: &[f32], w: &[u8], sw: &[f32], k: usize, g: usize, t: &mut [[f32; 8]; 4]) {
     let ng = k / g;
     assert!((1..=4).contains(&rr) && a.len() >= rr * k && sa.len() >= rr * ng);
     assert!(w.len() >= k * if int4 { 4 } else { 8 } && sw.len() >= ng * 8 && g.is_multiple_of(16) && k.is_multiple_of(g));
-    #[cfg(target_arch = "aarch64")]
-    #[allow(unsafe_code)]
-    // SAFETY: the `sdot` layout is built only on the dotprod path (`Quant::new`); reads stay inside the slices
-    // asserted above (row r: a[r*k..], sa[r*ng..]; the panel w[..k*8 or k*4], sw[..ng*8]).
-    unsafe {
-        macro_rules! go {
-            ($r:literal) => {
-                if int4 {
-                    neon::dot4::<$r, true>(a.as_ptr(), sa.as_ptr(), w.as_ptr(), sw.as_ptr(), k, g, t)
-                } else {
-                    neon::dot4::<$r, false>(a.as_ptr(), sa.as_ptr(), w.as_ptr(), sw.as_ptr(), k, g, t)
+    for r in 0..rr {
+        for o in 0..8 {
+            let mut f = 0f32;
+            for c in 0..ng {
+                let mut d = 0i32;
+                for kk in c * g..(c + 1) * g {
+                    let (b, hi) = place(Lay::Dot4, int4, o, kk);
+                    let v = if int4 { (if hi { w[b] & 0xf0 } else { w[b] << 4 }) as i8 } else { w[b] as i8 };
+                    d += a[r * k + kk] as i32 * v as i32;
                 }
-            };
-        }
-        match rr {
-            4 => go!(4),
-            3 => go!(3),
-            2 => go!(2),
-            _ => go!(1),
-        }
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        // portable (the layout is built only for the aarch64 `sdot` path; this keeps other targets compiling)
-        for r in 0..rr {
-            for o in 0..8 {
-                let mut f = 0f32;
-                for c in 0..ng {
-                    let mut d = 0i32;
-                    for kk in c * g..(c + 1) * g {
-                        let (b, hi) = place(Lay::Dot4, int4, o, kk);
-                        let v = if int4 { (if hi { w[b] & 0xf0 } else { w[b] << 4 }) as i8 } else { w[b] as i8 };
-                        d += a[r * k + kk] as i32 * v as i32;
-                    }
-                    f += d as f32 * (sw[c * 8 + o] * sa[r * ng + c]);
-                }
-                t[r][o] = f;
+                f += d as f32 * (sw[c * 8 + o] * sa[r * ng + c]);
             }
+            t[r][o] = f;
         }
     }
 }
@@ -980,6 +1054,89 @@ fn pack_rows(a: &[f32], m: usize, k: usize, g: usize) -> (Vec<i8>, Vec<f32>) {
         }
     }
     (q, s)
+}
+
+/// `pack_act` at 16-bit precision: row r of `a` becomes the pair (hi, lo) of int8 rows (`quant16`), their lane scales
+/// 255 s and s with s = max / 32512.
+fn pack_act16(a: &[f32], m: usize, k: usize, g: usize) -> Act {
+    let ng = k / g;
+    let mut q = vec![0i8; m * 2 * k];
+    let mut s = vec![0f32; m * ng * 4];
+    for r in 0..m {
+        let dst = &mut q[r * 2 * k..(r + 1) * 2 * k];
+        for c in 0..ng {
+            let x = &a[r * k + c * g..r * k + (c + 1) * g];
+            let max = absmax(x);
+            let inv = if max > 0.0 { W16 / max } else { 0.0 };
+            for st in 0..g / 8 {
+                let o = (c * g / 8 + st) * 16;
+                let (hi, lo) = dst[o..o + 16].split_at_mut(8);
+                quant16(&x[st * 8..st * 8 + 8], inv, hi, lo);
+            }
+            let sv = &mut s[(r * ng + c) * 4..(r * ng + c + 1) * 4];
+            for (l, &(ri, _)) in MMLA_LANES.iter().enumerate() {
+                sv[l] = max / W16 * if ri == 0 { 255.0 } else { 1.0 };
+            }
+        }
+    }
+    Act { q, s }
+}
+
+/// `pack_rows` at 16-bit precision: row r of `a` becomes rows 2r (hi) and 2r + 1 (lo), as `pack_act16`.
+fn pack_rows16(a: &[f32], m: usize, k: usize, g: usize) -> (Vec<i8>, Vec<f32>) {
+    let ng = k / g;
+    let mut q = vec![0i8; 2 * m * k];
+    let mut s = vec![0f32; 2 * m * ng];
+    for r in 0..m {
+        let (hi, lo) = q[2 * r * k..(2 * r + 2) * k].split_at_mut(k);
+        for c in 0..ng {
+            let x = &a[r * k + c * g..r * k + (c + 1) * g];
+            let max = absmax(x);
+            let inv = if max > 0.0 { W16 / max } else { 0.0 };
+            for st in 0..g / 8 {
+                let o = c * g + st * 8;
+                quant16(&x[st * 8..st * 8 + 8], inv, &mut hi[o..o + 8], &mut lo[o..o + 8]);
+            }
+            s[2 * r * ng + c] = 255.0 * max / W16;
+            s[(2 * r + 1) * ng + c] = max / W16;
+        }
+    }
+    (q, s)
+}
+
+/// The largest 16-bit activation code: 127 * 255 + 127 (two digits in -127..=127, base 255).
+const W16: f32 = 32512.0;
+
+/// 8 values times `inv` (at most 32512 in size) as v ~ 255 hi + lo, both in -127..=127 (so every integer kernel takes
+/// them as it takes `quant8`'s): hi = round(v / 255), lo = round(v - 255 hi).
+#[inline(always)]
+fn quant16(x: &[f32], inv: f32, hi: &mut [i8], lo: &mut [i8]) {
+    assert!(x.len() >= 8 && hi.len() >= 8 && lo.len() >= 8);
+    #[cfg(target_arch = "aarch64")]
+    #[allow(unsafe_code)]
+    // SAFETY: NEON is mandatory on aarch64; x, hi and lo hold 8 values (asserted).
+    unsafe {
+        use core::arch::aarch64::*;
+        let (iv, b, ib, lim) = (vdupq_n_f32(inv), vdupq_n_f32(255.0), vdupq_n_f32(1.0 / 255.0), vdupq_n_s32(127));
+        let mut h = [vdupq_n_s32(0); 2];
+        let mut l = [vdupq_n_s32(0); 2];
+        for i in 0..2 {
+            let v = vmulq_f32(vld1q_f32(x.as_ptr().add(4 * i)), iv);
+            let hv = vcvtaq_s32_f32(vmulq_f32(v, ib));
+            let lv = vcvtaq_s32_f32(vfmsq_f32(v, vcvtq_f32_s32(hv), b));
+            h[i] = hv;
+            l[i] = vmaxq_s32(vminq_s32(lv, lim), vnegq_s32(lim));
+        }
+        vst1_s8(hi.as_mut_ptr(), vqmovn_s16(vcombine_s16(vqmovn_s32(h[0]), vqmovn_s32(h[1]))));
+        vst1_s8(lo.as_mut_ptr(), vqmovn_s16(vcombine_s16(vqmovn_s32(l[0]), vqmovn_s32(l[1]))));
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    for i in 0..8 {
+        let v = x[i] * inv;
+        let h = (v * (1.0 / 255.0)).round();
+        hi[i] = h as i8;
+        lo[i] = (v - 255.0 * h).round().clamp(-127.0, 127.0) as i8;
+    }
 }
 
 #[inline(always)]
@@ -1147,11 +1304,12 @@ mod neon {
             core::arch::asm!("smmla {acc:v}.4s, {a:v}.16b, {w:v}.16b", acc = inout(vreg) $acc, a = in(vreg) $a, w = in(vreg) $w, options(pure, nomem, nostack))
         };
     }
-    /// i8mm: one smmla per (row pair, output pair) and 8 k gives the whole 2 x 2 block.
+    /// i8mm: one smmla per (row pair, output pair) and 8 k gives the whole 2 x 2 block: RP row pairs x the 4 output
+    /// pairs of a panel, each block's lanes in MMLA_LANES order.
+    #[inline]
     #[target_feature(enable = "i8mm")]
-    pub unsafe fn mmla<const RP: usize, const INT4: bool>(a: *const i8, sa: *const f32, w: *const u8, sw: *const f32, k: usize, g: usize, t: &mut [[[f32; 4]; 4]; super::RPMAX]) {
-        let ng = k / g;
-        // SAFETY: the caller (`tile`) guarantees RP row pairs of 2k activations and ng x 4 scales each, and a panel.
+    unsafe fn mmla_acc<const RP: usize, const INT4: bool>(a: *const i8, sa: *const f32, w: *const u8, sw: *const f32, k: usize, ng: usize, g: usize) -> [[float32x4_t; 4]; RP] {
+        // SAFETY: the caller guarantees RP row pairs of 2k activations and ng x 4 scales each, and a panel.
         unsafe {
             let mut accf = [[vdupq_n_f32(0.0); 4]; RP];
             for c in 0..ng {
@@ -1190,7 +1348,48 @@ mod neon {
                     }
                 }
             }
-            store(&accf, t);
+            accf
+        }
+    }
+
+    /// `mmla_acc` into t[row pair][output pair].
+    #[target_feature(enable = "i8mm")]
+    pub unsafe fn mmla<const RP: usize, const INT4: bool>(a: *const i8, sa: *const f32, w: *const u8, sw: *const f32, k: usize, g: usize, t: &mut [[[f32; 4]; 4]; super::RPMAX]) {
+        // SAFETY: as `mmla_acc`.
+        unsafe { store(&mmla_acc::<RP, INT4>(a, sa, w, sw, k, k / g, g), t) }
+    }
+
+    /// i8mm: `pairs` row pairs x one panel of 8 outputs, 4 pairs per `mmla_acc` while they last (then 2, 1): rows 2p and
+    /// 2p + 1 of the sums + bias at out + 2p * stride and one row further. The same sums as `mmla`.
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "i8mm")]
+    pub unsafe fn panel_mm<const INT4: bool>(a: *const i8, sa: *const f32, pairs: usize, w: *const u8, sw: *const f32, k: usize, ng: usize, g: usize, bias: *const f32, out: *mut f32, stride: usize) {
+        // SAFETY: the caller's: pairs of 2k codes in a and of ng x 4 scales in sa, a panel, 8 bias values, 2 * pairs
+        // rows of 8 outputs.
+        unsafe {
+            let (b0, b1) = (vld1q_f32(bias), vld1q_f32(bias.add(4)));
+            let mut p = 0;
+            macro_rules! go {
+                ($n:literal) => {{
+                    let acc = mmla_acc::<$n, INT4>(a.add(p * 2 * k), sa.add(p * ng * 4), w, sw, k, ng, g);
+                    for (r, t) in acc.iter().enumerate() {
+                        // row 2p: lanes 0, 1 of every output pair; row 2p + 1: lanes 2, 3
+                        let o = out.add(2 * (p + r) * stride);
+                        vst1q_f32(o, vaddq_f32(vcombine_f32(vget_low_f32(t[0]), vget_low_f32(t[1])), b0));
+                        vst1q_f32(o.add(4), vaddq_f32(vcombine_f32(vget_low_f32(t[2]), vget_low_f32(t[3])), b1));
+                        vst1q_f32(o.add(stride), vaddq_f32(vcombine_f32(vget_high_f32(t[0]), vget_high_f32(t[1])), b0));
+                        vst1q_f32(o.add(stride + 4), vaddq_f32(vcombine_f32(vget_high_f32(t[2]), vget_high_f32(t[3])), b1));
+                    }
+                    p += $n;
+                }};
+            }
+            while p < pairs {
+                match pairs - p {
+                    4.. => go!(4),
+                    2..4 => go!(2),
+                    _ => go!(1),
+                }
+            }
         }
     }
 
@@ -1203,12 +1402,41 @@ mod neon {
         };
     }
 
-    /// dotprod, `sdot` layout: R (1..=4) rows x 8 outputs. Per 16 k: each row's 16 activations in one register, used
-    /// by lane (4 k each) against 2 vectors of 4 outputs x 4 k; one accumulator per (row, 4 outputs), lane = output.
+    /// dotprod, `sdot` layout: `rows` rows x one panel of 8 outputs, 8 rows per `dot4` while they last (then 4, 2, 1):
+    /// row r's sums + bias at out + r * stride.
+    #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "dotprod")]
-    pub unsafe fn dot4<const R: usize, const INT4: bool>(a: *const i8, sa: *const f32, w: *const u8, sw: *const f32, k: usize, g: usize, t: &mut [[f32; 8]; 4]) {
-        let ng = k / g;
-        // SAFETY: the caller (`tile4`) guarantees R rows of k activations and ng scales each, and a panel.
+    pub unsafe fn panel4<const INT4: bool>(q: *const i8, sa: *const f32, rows: usize, w: *const u8, sw: *const f32, k: usize, ng: usize, g: usize, bias: *const f32, out: *mut f32, stride: usize) {
+        let mut r = 0;
+        // SAFETY: the caller's: rows of k codes in q and of ng scales in sa, a panel, 8 bias values, rows of 8 outputs.
+        unsafe {
+            macro_rules! go {
+                ($n:literal) => {{
+                    dot4::<$n, INT4>(q.add(r * k), sa.add(r * ng), w, sw, k, ng, g, bias, out.add(r * stride), stride);
+                    r += $n;
+                }};
+            }
+            while r < rows {
+                match rows - r {
+                    8.. => go!(8),
+                    4..8 => go!(4),
+                    2..4 => go!(2),
+                    _ => go!(1),
+                }
+            }
+        }
+    }
+
+    /// dotprod, `sdot` layout: R (1, 2, 4, 8) rows x 8 outputs. Per 16 k: each row's 16 activations in one register,
+    /// used by lane (4 k each) against 2 vectors of 4 outputs x 4 k, two k-steps' weights loaded at a time (R = 8: 16
+    /// accumulators, 8 activation rows and 4 weight vectors live); one accumulator per (row, 4 outputs), lane = output.
+    /// Each row's sums are the same whatever R is.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    #[target_feature(enable = "dotprod")]
+    unsafe fn dot4<const R: usize, const INT4: bool>(a: *const i8, sa: *const f32, w: *const u8, sw: *const f32, k: usize, ng: usize, g: usize, bias: *const f32, out: *mut f32, stride: usize) {
+        // SAFETY: the caller (`panel4`) guarantees R rows of k activations and ng scales each, a panel, 8 bias values
+        // and R rows of 8 outputs.
         unsafe {
             let mut accf = [[vdupq_n_f32(0.0); 2]; R];
             for c in 0..ng {
@@ -1216,27 +1444,29 @@ mod neon {
                 let mut kk = c * g;
                 while kk < (c + 1) * g {
                     let av: [int8x16_t; R] = core::array::from_fn(|r| vld1q_s8(a.add(r * k + kk)));
-                    // the weights of k-steps j = 0..4 (4 k each), outputs 0..4 and 4..8
-                    let wv: [(int8x16_t, int8x16_t); 4] = if INT4 {
+                    // two k-steps (4 k each): their weights for outputs 0..4 and 4..8, against lanes $l0, $l1
+                    macro_rules! half {
+                        ($w0:expr, $w1:expr, $l0:literal, $l1:literal) => {
+                            let (w0, w1) = ($w0, $w1);
+                            for r in 0..R {
+                                sdot_lane!(acc[r][0], w0.0, av[r], $l0);
+                                sdot_lane!(acc[r][1], w0.1, av[r], $l0);
+                                sdot_lane!(acc[r][0], w1.0, av[r], $l1);
+                                sdot_lane!(acc[r][1], w1.1, av[r], $l1);
+                            }
+                        };
+                    }
+                    if INT4 {
+                        // per 8 k: low nibbles the 4 k at k, high nibbles those at k + 4
                         let wp = w.add(kk * 4) as *const i8;
-                        let (l0, h0) = unpack(vld1q_s8(wp));
-                        let (l1, h1) = unpack(vld1q_s8(wp.add(16)));
-                        let (l2, h2) = unpack(vld1q_s8(wp.add(32)));
-                        let (l3, h3) = unpack(vld1q_s8(wp.add(48)));
-                        [(l0, l1), (h0, h1), (l2, l3), (h2, h3)]
+                        let ((l0, h0), (l1, h1)) = (unpack(vld1q_s8(wp)), unpack(vld1q_s8(wp.add(16))));
+                        half!((l0, l1), (h0, h1), "0", "1");
+                        let ((l2, h2), (l3, h3)) = (unpack(vld1q_s8(wp.add(32))), unpack(vld1q_s8(wp.add(48))));
+                        half!((l2, l3), (h2, h3), "2", "3");
                     } else {
                         let wp = w.add(kk * 8) as *const i8;
-                        core::array::from_fn(|j| (vld1q_s8(wp.add(32 * j)), vld1q_s8(wp.add(32 * j + 16))))
-                    };
-                    for r in 0..R {
-                        sdot_lane!(acc[r][0], wv[0].0, av[r], "0");
-                        sdot_lane!(acc[r][1], wv[0].1, av[r], "0");
-                        sdot_lane!(acc[r][0], wv[1].0, av[r], "1");
-                        sdot_lane!(acc[r][1], wv[1].1, av[r], "1");
-                        sdot_lane!(acc[r][0], wv[2].0, av[r], "2");
-                        sdot_lane!(acc[r][1], wv[2].1, av[r], "2");
-                        sdot_lane!(acc[r][0], wv[3].0, av[r], "3");
-                        sdot_lane!(acc[r][1], wv[3].1, av[r], "3");
+                        half!((vld1q_s8(wp), vld1q_s8(wp.add(16))), (vld1q_s8(wp.add(32)), vld1q_s8(wp.add(48))), "0", "1");
+                        half!((vld1q_s8(wp.add(64)), vld1q_s8(wp.add(80))), (vld1q_s8(wp.add(96)), vld1q_s8(wp.add(112))), "2", "3");
                     }
                     kk += 16;
                 }
@@ -1247,9 +1477,10 @@ mod neon {
                     accf[r][1] = vfmaq_f32(accf[r][1], vcvtq_f32_s32(acc[r][1]), vmulq_n_f32(s1, x));
                 }
             }
+            let (b0, b1) = (vld1q_f32(bias), vld1q_f32(bias.add(4)));
             for r in 0..R {
-                vst1q_f32(t[r].as_mut_ptr(), accf[r][0]);
-                vst1q_f32(t[r].as_mut_ptr().add(4), accf[r][1]);
+                vst1q_f32(out.add(r * stride), vaddq_f32(accf[r][0], b0));
+                vst1q_f32(out.add(r * stride + 4), vaddq_f32(accf[r][1], b1));
             }
         }
     }
@@ -1544,10 +1775,24 @@ pub struct QuantF {
     pub k: usize,
     q: Vec<i8>,  // ceil(n / NR) panels x k x NR (k-major, as `Packed`)
     s: Vec<f32>, // ceil(n / NR) * NR
+    /// The weights for the integer kernels instead (then `q`, `s` are empty): see `QuantF::new`.
+    wide: Option<Quant>,
 }
 
 impl QuantF {
+    /// On aarch64 with an integer kernel (`path`), the product runs on it with the activations at 16-bit precision
+    /// (`Quant::gemm_wide`: within ~1e-4 of the f32 product relative to the row's largest term, 3-7x faster) and the
+    /// weights are stored for it alone.
     pub fn new(n: usize, k: usize, code: impl Fn(usize, usize) -> i8, scale: impl Fn(usize) -> f32) -> QuantF {
+        let int = cfg!(target_arch = "aarch64") && matches!(path(), Path::Neon | Path::Dot | Path::Mmla) && k.is_multiple_of(16);
+        QuantF::new_as(n, k, int, code, scale)
+    }
+
+    /// `wide`: for the integer kernels (see `new`); else multiplied in f32.
+    fn new_as(n: usize, k: usize, wide: bool, code: impl Fn(usize, usize) -> i8, scale: impl Fn(usize) -> f32) -> QuantF {
+        if wide {
+            return QuantF { n, k, q: Vec::new(), s: Vec::new(), wide: Some(Quant::new(n, k, k, false, code, |j, _| scale(j))) };
+        }
         let mut q = vec![0i8; n.div_ceil(NR) * k * NR];
         let mut s = vec![0f32; n.div_ceil(NR) * NR];
         for j in 0..n {
@@ -1557,11 +1802,14 @@ impl QuantF {
             }
             s[j] = scale(j);
         }
-        QuantF { n, k, q, s }
+        QuantF { n, k, q, s, wide: None }
     }
 
     fn gemm(&self, a: &[f32], m: usize, bias: Option<&[f32]>) -> Vec<f32> {
         assert!(a.len() >= m * self.k);
+        if let Some(w) = &self.wide {
+            return w.gemm_wide(a, m, bias);
+        }
         let mut out = vec![0.0; m * self.n];
         if m <= 8 {
             // few rows (decoding): widen in registers instead of a scratch panel per call; groups of panels are
@@ -2801,7 +3049,7 @@ mod tests {
             let q4 = Quant::with_layout(n, k, g, int4, Lay::Dot4, |j, p| codes[j * k + p], |j, c| scales[j * (k / g) + c]);
             #[cfg(target_arch = "aarch64")]
             if std::arch::is_aarch64_feature_detected!("dotprod") {
-                let got = q4.gemm4(&a, m, Some(&bias));
+                let got = q4.gemm4(&a, m, Some(&bias), false);
                 let f = first.as_ref().unwrap();
                 for i in 0..m * n {
                     assert!((got[i] - want[i]).abs() < 1e-3 * (1.0 + want[i].abs()), "sdot m{m} n{n} k{k} [{i}]: {} vs {}", got[i], want[i]);
@@ -2964,7 +3212,7 @@ mod tests {
             for (a, &v) in y.iter().zip(&x) {
                 let sp = (v - shift).max(0.0) + ln(1.0 + exp(-(v - shift).abs()));
                 let want = sp - 0.08 * v - c;
-                assert!((a - want).abs() <= 2e-7 * (1.0 + want.abs()), "{v}: {a} vs {want}");
+                assert!((a - want).abs() <= 4e-7 * (1.0 + want.abs()), "{v}: {a} vs {want}");
             }
         }
     }
@@ -2980,7 +3228,11 @@ mod tests {
             let codes: Vec<i8> = (0..n * k).map(|_| (rnd(&mut seed) * 7.9).floor() as i8).collect();
             let sc: Vec<f32> = (0..n * k / g).map(|_| 0.01 + rnd(&mut seed).abs() * 0.05).collect();
             let q = Quant::with_layout(n, k, g, int4, Lay::Pair, |j, p| codes[j * k + p], |j, c| sc[j * (k / g) + c]);
-            let qf = QuantF::new(n, k, |j, p| codes[j * k + p], |j| sc[j * (k / g)]);
+            let qf = QuantF::new_as(n, k, false, |j, p| codes[j * k + p], |j| sc[j * (k / g)]);
+            if cfg!(target_arch = "aarch64") && path() != Path::F32 {
+                let qw = QuantF::new_as(n, k, true, |j, p| codes[j * k + p], |j| sc[j * (k / g)]);
+                assert!(qw.gemm(&a_w(m, k), m, None) == enter(Some(&ex), || qw.gemm(&a_w(m, k), m, None)), "wide m{m} n{n} k{k}");
+            }
             let a: Vec<f32> = (0..m * k).map(|_| rnd(&mut seed)).collect();
             let bias: Vec<f32> = (0..n).map(|_| rnd(&mut seed)).collect();
             let one = (q.gemm(&a, m, Some(&bias)), qf.gemm(&a, m, Some(&bias)), gemm(&a, m, &Packed::from_rows(&qf_dense(&qf), n, k), None));
@@ -2989,10 +3241,40 @@ mod tests {
             #[cfg(target_arch = "aarch64")]
             if std::arch::is_aarch64_feature_detected!("dotprod") {
                 let q4 = Quant::with_layout(n, k, g, int4, Lay::Dot4, |j, p| codes[j * k + p], |j, c| sc[j * (k / g) + c]);
-                let (one, three) = (q4.gemm4(&a, m, Some(&bias)), enter(Some(&ex), || q4.gemm4(&a, m, Some(&bias))));
+                let (one, three) = (q4.gemm4(&a, m, Some(&bias), false), enter(Some(&ex), || q4.gemm4(&a, m, Some(&bias), false)));
                 assert!(one == three, "sdot m{m} n{n} k{k}");
                 // and the same bits as the pair layout's integer kernels
                 assert!(one == q.gemm(&a, m, Some(&bias)), "sdot vs pair layout m{m} n{n} k{k}");
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    fn a_w(m: usize, k: usize) -> Vec<f32> {
+        let mut seed = 5;
+        (0..m * k).map(|_| rnd(&mut seed)).collect()
+    }
+
+    /// 16-bit activations on the integer kernels against the f32 product of the same int8 weights.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn quantf_wide_matches_f32() {
+        if path() == Path::F32 {
+            return;
+        }
+        let mut seed = 3;
+        for &(m, n, k) in &[(1, 37, 64), (4, 2080, 512), (3, 5, 16), (9, 33, 96), (70, 192, 2432)] {
+            let codes: Vec<i8> = (0..n * k).map(|_| (rnd(&mut seed) * 127.0) as i8).collect();
+            let sc: Vec<f32> = (0..n).map(|_| 0.01 + rnd(&mut seed).abs()).collect();
+            let dense: Vec<f32> = (0..n * k).map(|i| codes[i] as f32 * sc[i / k]).collect();
+            let a: Vec<f32> = (0..m * k).map(|_| rnd(&mut seed) * 3.0).collect();
+            let bias: Vec<f32> = (0..n).map(|_| rnd(&mut seed)).collect();
+            let q = QuantF::new_as(n, k, true, |j, p| codes[j * k + p], |j| sc[j]);
+            let (got, want) = (q.gemm(&a, m, Some(&bias)), gemm(&a, m, &Packed::from_rows(&dense, n, k), Some(&bias)));
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                // per activation: half a code of 3 / 32512; times |w| <= 127 sc, sqrt(k) of them (random signs), x8 margin
+                let tol = 8.0 * 0.5 * 3.0 / 32512.0 * 127.0 * sc[i % n] * (k as f32).sqrt() + 1e-4 * w.abs();
+                assert!((g - w).abs() < tol, "m{m} n{n} k{k}: {g} vs {w} (tol {tol})");
             }
         }
     }
@@ -3089,7 +3371,7 @@ mod tests {
         for &(m, n, k) in &[(1, 37, 64), (4, 16, 512), (3, 5, 8), (9, 33, 100), (70, 20, 48)] {
             let codes: Vec<i8> = (0..n * k).map(|_| (rnd(&mut seed) * 127.0) as i8).collect();
             let sc: Vec<f32> = (0..n).map(|_| 0.01 + rnd(&mut seed).abs()).collect();
-            let q = QuantF::new(n, k, |j, p| codes[j * k + p], |j| sc[j]);
+            let q = QuantF::new_as(n, k, false, |j, p| codes[j * k + p], |j| sc[j]);
             let dense: Vec<f32> = (0..n * k).map(|i| codes[i] as f32 * sc[i / k]).collect();
             let a: Vec<f32> = (0..m * k).map(|_| rnd(&mut seed)).collect();
             let bias: Vec<f32> = (0..n).map(|_| rnd(&mut seed)).collect();

@@ -2,7 +2,8 @@
 //!
 //! Silero VAD marks speech over the whole file first. Then each piece runs from the end of the last one to the end of the sentence: a pause where
 //! the end-of-turn head says the speaker has finished (asked at 0.24 s into each pause, as live), or 3 s of silence; at
-//! most 20 s. It is decoded with the live session's pause compression and left context; a piece cut at 20 s keeps
+//! most 20 s. It is decoded with the live session's pause compression and left context (a piece the head ended: from
+//! the encoder output the head read, `next_here`); a piece cut at 20 s keeps
 //! its words up to the last . ? ! (else up to its longest pause) and the rest is decoded again with the next piece,
 //! as the live session does.
 
@@ -12,7 +13,7 @@ use alloc::vec::Vec;
 use crate::model::Token;
 
 use crate::session::{CAP, FR, PAD, SR, close, compress, longest_pause, open_end};
-use crate::text::{W, balance_quotes, cap, end_mark, is_end, show_quotes, spans, trim_trail, units, words};
+use crate::text::{W, balance_quotes, cap, end_mark, heard_until, is_end, show_quotes, spans, trim_trail, units, words};
 use crate::vad::{CHUNK, VadState};
 use crate::{Models, Word, allowed};
 
@@ -94,18 +95,40 @@ impl Iterator for Transcription<'_> {
 impl Transcription<'_> {
     fn next_here(&mut self) -> Option<Vec<Word>> {
         let n = self.vf.len();
+        // one language: when the end-of-turn head ends the sentence, the piece is decoded from the encoder output the
+        // head has just read: one encoder pass, not two. That audio ends 0.24 s into the pause, with no silence added
+        // (the head needs it so: with 0.8 s more silence heard, its P falls from ~0.95 to ~0.4); the words come out
+        // the same or better (FLEURS, LibriSpeech, Golos, VOA: WER within +-0.3 of decoding the piece again with the
+        // silence added, no last words lost)
+        let share = self.langs.len() == 1 && self.m.asr.has_head();
         loop {
             let first = (self.open0..n).find(|&i| self.vf[i])?;
             // the piece: up to 3 s of silence, at most CAP of audio from its first speech
             let cap_end = first + (CAP / FR) as usize;
             let (mut b, mut quiet, mut eou) = (first, 0, false);
+            let mut pre = None; // the frame map and encoder output the head read
+            let mut heard = None; // and where its audio stops (s)
             while b < n && b < cap_end && quiet < LONG {
                 quiet = if self.vf[b] { 0 } else { quiet + 1 };
                 b += 1;
                 // 0.24 s into a pause: has the speaker finished? (the turn so far, <= 30 s; ended at 0.48 s of silence)
                 if quiet == 6 && self.m.asr.has_head() && self.vf[b..(b + 6).min(n)].iter().all(|v| !v) {
-                    let from = self.open0.max(b.saturating_sub(750));
-                    if self.m.eou(&self.audio[from * FR as usize..b * FR as usize], self.lang).is_some_and(|p| p > 0.5) {
+                    let p = if share && self.ctx == 0 {
+                        // the turn as a decoding hears it (long silences cut), up to this point of the pause
+                        let (mut x, map) = compress(&self.audio[self.open0 * FR as usize..b * FR as usize], &self.vf[self.open0..b], self.open0 as i64);
+                        x.truncate(map.len() * FR as usize);
+                        let e = self.m.asr.encode_audio(&x, self.lang);
+                        let p = e.as_ref().and_then(|(enc, te)| self.m.asr.head_on(enc, *te, self.lang).1);
+                        if p.is_some_and(|p| p > 0.5) {
+                            pre = e.map(|e| (map, e));
+                            heard = Some((b as i64 * FR) as f64 / SR as f64);
+                        }
+                        p
+                    } else {
+                        let from = self.open0.max(b.saturating_sub(750));
+                        self.m.eou(&self.audio[from * FR as usize..b * FR as usize], self.lang)
+                    };
+                    if p.is_some_and(|p| p > 0.5) {
                         b = (b + 6).min(n);
                         eou = true;
                         break;
@@ -116,8 +139,14 @@ impl Transcription<'_> {
             let full = !end && b >= cap_end && b < n; // cut short: more speech may follow
             let last = !end && b >= n; // the audio ends inside the sentence
             let a = self.open0.saturating_sub(self.ctx);
-            let (x, map) = compress(&self.audio[a * FR as usize..b * FR as usize], &self.vf[a..b], a as i64);
-            let (tk, picked) = self.m.full(&x, &self.langs, self.beam, false);
+            let (tk, picked, map) = match pre {
+                Some((map, (enc, te))) => (self.m.asr.search(&enc, te, self.lang, self.beam, false), Some(self.lang), map),
+                None => {
+                    let (x, map) = compress(&self.audio[a * FR as usize..b * FR as usize], &self.vf[a..b], a as i64);
+                    let (tk, picked) = self.m.full(&x, &self.langs, self.beam, false);
+                    (tk, picked, map)
+                }
+            };
             if let Some(l) = picked {
                 self.lang = l;
             }
@@ -125,6 +154,9 @@ impl Transcription<'_> {
             // the left context's own words are dropped
             let o0 = (self.open0 as i64 * FR) as f64 / SR as f64 - 0.02;
             let mut ws: Vec<W> = words(&self.m.asr.pieces, &tk, 0.0).into_iter().filter(|w| w.t >= o0).collect();
+            if let (Some(t), Some(w)) = (heard, ws.last_mut()) {
+                heard_until(w, t);
+            }
             let (keep, next, ctx) = if !full || ws.len() < 2 {
                 // a sentence end or the end of the audio
                 if end {
