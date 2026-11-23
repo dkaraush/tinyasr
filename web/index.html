@@ -235,6 +235,11 @@ const MODELS = [
   { file: "ar.tzf", name: "Arabic (standard + 11 dialects)", langs: ["ar", "ar-EG", "ar-Levantine", "ar-Gulf", "ar-IQ", "ar-MA", "ar-DZ", "ar-TN", "ar-LY", "ar-SD", "ar-YE", "ar-MR"], mb: 31.3 },
   // Indonesian, English words inside kept
   { file: "id.tzf", name: "Indonesian", langs: ["id"], mb: 31.3 },
+  // Indonesian + Malay (TZF4: the code also sets the decoder, so each is written its own way: karena / kerana); English words inside kept
+  { file: "id-ms.tzf", name: "Indonesian, Malay", langs: ["id", "ms"], mb: 31.3 },
+  // French + German (no English block: first_block_all = 0); English words and brands inside kept
+  // French + German (TZF5, tinyasr 5: no English block, so each language keeps to its own pieces)
+  { file: "fr-de.tzf", name: "French, German", langs: ["fr", "de"], mb: 32.3 },
 ];
 // fetches name.gz, or name itself when there's no .gz
 async function fetchModelFile(name) {
@@ -250,11 +255,13 @@ async function gunzip(buf) {
   if (b[0] !== 0x1f || b[1] !== 0x8b) return buf;
   return new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer();
 }
-const NAMES = { en: "English", ru: "Русский", uk: "Українська", es: "Español", it: "Italiano", pt: "Português", uz: "Oʻzbekcha", fa: "فارسی", km: "ខ្មែរ", ar: "العربية", id: "Bahasa Indonesia" };
-// Auto-detect: the model each language is recognized with (en, ru: the en-ru-uk model). Arabic and Indonesian are not
-// here: tinylid has neither yet, so their models are chosen from the model list
+const NAMES = { en: "English", ru: "Русский", uk: "Українська", es: "Español", it: "Italiano", pt: "Português", uz: "Oʻzbekcha", fa: "فارسی", km: "ខ្មែរ", ar: "العربية", id: "Bahasa Indonesia", ms: "Bahasa Melayu", fr: "Français", de: "Deutsch" };
+// Auto-detect: the model each language is recognized with (en, ru: the en-ru-uk model). tinylid v14 (60 classes, 2026-11-23)
+// knows Indonesian and Malay (-> id-ms.tzf: one model for both, so tinylid's id/ms mix-ups stay inside it and the code picks
+// the spelling), French and German (-> fr-de.tzf); Arabic is not here yet, so its model is chosen from the model list
 
-const MODEL_OF = { en: 0, ru: 0, uk: 0, es: 1, it: 1, pt: 1, uz: 2, fa: 3, km: 4 };
+const MODEL_OF = { en: 0, ru: 0, uk: 0, es: 1, it: 1, pt: 1, uz: 2, fa: 3, km: 4, id: MODELS.findIndex(m => m.file === "id-ms.tzf"), ms: MODELS.findIndex(m => m.file === "id-ms.tzf"),
+  fr: MODELS.findIndex(m => m.file === "fr-de.tzf"), de: MODELS.findIndex(m => m.file === "fr-de.tzf") };
 // tinylid runs once the speech heard so far (pauses not counted) is this long; its top language counts when this sure.
 // Later checks hear more and can still correct an earlier verdict (a short window is often unsure or wrong).
 const LID_AT = [[1, 0.85], [2, 0.75], [5, 0.6], [10, 0.6], [20, 0.6]];

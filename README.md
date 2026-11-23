@@ -43,6 +43,10 @@ WER %, second pass (beam 4) / streaming (greedy)
 |  |  | English | 9.41 / 11.69 | 15.02 / 18.93 |
 | `ar` (62M) | 29.9 MiB | Arabic | 5.24 / 6.54 | 7.96 / 9.51 |
 | `id` (62M) | 29.9 MiB | Indonesian | 5.23 / 6.99 | 5.37 / 10.34 |
+| `id-ms` (62M) | 29.9 MiB | Indonesian | 5.59 / 7.54 | 5.61 / 10.19 |
+|  |  | Malay | 7.98 / 10.01 | — |
+| `fr-de` (62M) | 30.8 MiB | French | 8.35 / 9.82 | 13.63 / 15.21 |
+|  |  | German | 6.88 / 7.96 | 9.30 / 10.20 |
 
 ### License
 

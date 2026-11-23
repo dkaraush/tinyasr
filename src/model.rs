@@ -166,8 +166,10 @@ impl<'a> Tensors<'a> {
         let (v2, v3) = match r.take(4)? {
             b"TZF1" => (false, false),
             b"TZF2" => (true, false),
-            b"TZF3" | b"TZF4" => (true, true), // TZF4 (tinyasr 4): TZF3 + lang_dec (a version 3 library refuses it)
-            _ => return Err("not a tinyasr model file (TZF1/TZF2/TZF3/TZF4)"),
+            // TZF4 (tinyasr 4): TZF3 + lang_dec (a version 3 library refuses it); TZF5 (tinyasr 5): may set
+            // "first_block_all" = 0, which a version 4 library would ignore and decode wrongly, so it refuses TZF5
+            b"TZF3" | b"TZF4" | b"TZF5" => (true, true),
+            _ => return Err("not a tinyasr model file (TZF1/TZF2/TZF3/TZF4/TZF5)"),
         };
         let mut cfg = BTreeMap::new();
         for _ in 0..r.u32()? {
@@ -1433,14 +1435,18 @@ impl Model {
         };
         let jb = w.vec("joiner.output_linear.bias", vocab)?;
         let (shared, size) = (shared as u32, size as u32);
+        // "first_block_all" (TZF5, 2026-11-23, fr-de): 0 = block 0 is the first language's own, not English for every
+        // language (the fr-de model has no English block: its de must not write fr pieces); absent or 1: as before
+        let first_all = w.cfg.get("first_block_all").is_none_or(|&v| v != 0);
         let out = (0..n as u32)
             .map(|k| {
                 // shared block + English; a shared piece with a letter some language owns (ґ: Ukrainian; reserved ids,
                 // tok_dir/extra.json) only for the languages that own it
                 let own = &langs[k as usize].own;
                 let other = |c: char| !own.contains(c) && langs.iter().any(|l| l.own.contains(c));
+                let first = if first_all || k == 0 { shared + size } else { shared };
                 let mut ids: Vec<u32> =
-                    (0..shared + size).filter(|&i| i >= shared || !w.pieces.get(i as usize).is_some_and(|p| p.chars().any(other))).collect();
+                    (0..first).filter(|&i| i >= shared || !w.pieces.get(i as usize).is_some_and(|p| p.chars().any(other))).collect();
                 if k != 0 {
                     ids.extend(shared + k * size..shared + (k + 1) * size);
                 }

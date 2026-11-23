@@ -64,10 +64,11 @@ pub const SAMPLE_RATE: u32 = 16_000;
 /// Beam width of the full-context pass unless the host sets one ([`Options::beam`], [`Transcription::new`]); 1 is greedy.
 pub const DEFAULT_BEAM: usize = 4;
 
-/// Version of the library (its API and the model files it reads: TZF4, TZF3 plus a per-language decoder vector so a
-/// dialect code shapes the output; TZF3, which names its languages; the older TZF1/TZF2); C: `tinyasr_version()`.
+/// Version of the library (its API and the model files it reads: TZF5, which may give the first token block to the
+/// first language alone (a model without English); TZF4, TZF3 plus a per-language decoder vector so a dialect code
+/// shapes the output; TZF3, which names its languages; the older TZF1/TZF2); C: `tinyasr_version()`.
 pub fn version() -> u32 {
-    4
+    5
 }
 
 /// The languages a recognition may use, as the host allows them (codes, any case: BCP 47 tags are case-insensitive;
