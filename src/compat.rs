@@ -22,12 +22,14 @@ mod libm_shim {
         fn log(x: f64) -> f64;
         fn pow(x: f64, y: f64) -> f64;
         fn round(x: f64) -> f64;
+        fn roundf(x: f32) -> f32;
     }
 
     /// The libm-backed `f32` methods tinyasr uses.
     pub(crate) trait F32Ext: Sized {
         fn sqrt(self) -> Self;
         fn floor(self) -> Self;
+        fn round(self) -> Self;
         fn ln(self) -> Self;
         fn atan(self) -> Self;
         fn sin_cos(self) -> (f32, f32);
@@ -41,6 +43,10 @@ mod libm_shim {
         #[inline]
         fn floor(self) -> Self {
             unsafe { floorf(self) }
+        }
+        #[inline]
+        fn round(self) -> Self {
+            unsafe { roundf(self) }
         }
         #[inline]
         fn ln(self) -> Self {
