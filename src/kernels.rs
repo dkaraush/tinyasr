@@ -115,7 +115,7 @@ fn blocked(a: &[f32], b: &(impl Panels + Sync), bias: Option<&[f32]>, out: &mut 
             // SAFETY: the level was detected on this CPU (`x86`)
             match x86() {
                 X86::Avx512 => unsafe { x86::rows_avx512(&a[i0 * k..i1 * k], k, panel, &init, o, n, cols) },
-                X86::Avx2 => unsafe { x86::rows_avx2(&a[i0 * k..i1 * k], k, panel, &init, o, n, cols) },
+                X86::Avx2 | X86::Avx => unsafe { x86::rows_avx(&a[i0 * k..i1 * k], k, panel, &init, o, n, cols) },
                 X86::Sse2 => rows(&a[i0 * k..i1 * k], k, panel, &init, o, n, cols),
             }
             #[cfg(not(target_arch = "x86_64"))]
@@ -295,11 +295,15 @@ pub fn swoosh4(x: &mut [f32], shift: f32, c: f32) {
 }
 
 /// Runs `f` (inlined) with this CPU's vector extensions on, so the loops in it that LLVM vectorizes use them (x86-64:
-/// AVX2 / AVX-512, detected at run time). The same operations per value: the same bits.
+/// AVX / AVX2 / AVX-512, detected at run time). The same operations per value: the same bits.
 #[inline(always)]
 pub fn vector<R>(f: impl FnOnce() -> R) -> R {
     #[cfg(target_arch = "x86_64")]
     {
+        #[target_feature(enable = "avx")]
+        fn avx<R>(f: impl FnOnce() -> R) -> R {
+            f()
+        }
         #[target_feature(enable = "avx2,fma")]
         fn avx2<R>(f: impl FnOnce() -> R) -> R {
             f()
@@ -313,6 +317,7 @@ pub fn vector<R>(f: impl FnOnce() -> R) -> R {
         match x86() {
             X86::Avx512 => return unsafe { avx512(f) },
             X86::Avx2 => return unsafe { avx2(f) },
+            X86::Avx => return unsafe { avx(f) },
             X86::Sse2 => {}
         }
     }
@@ -381,7 +386,7 @@ pub enum Path {
     Mmla,
     /// wasm SIMD128: widening multiplies (`i16x8.extmul_*_i8x16_s`).
     Wasm,
-    /// x86-64 AVX2 (`vpmaddubsw`), AVX-VNNI or AVX-512 VNNI (`vpdpbusd`): `IntX86`.
+    /// x86-64 AVX / AVX2 (`vpmaddubsw`), AVX-VNNI or AVX-512 VNNI (`vpdpbusd`): `IntX86`.
     X86,
 }
 
@@ -443,8 +448,8 @@ pub fn path() -> Path {
     }
     #[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
     {
-        // the integer arithmetic of the ARM kernels: x86-64 with AVX2 by default (its own kernels, the same results),
-        // TINYASR_INT8=scalar (portable); TINYASR_INT8=0 or no AVX2: f32
+        // the integer arithmetic of the ARM kernels: x86-64 with AVX by default (its own kernels, the same results),
+        // TINYASR_INT8=scalar (portable); TINYASR_INT8=0 or no AVX: f32
         #[cfg(feature = "std")]
         {
             static P: std::sync::OnceLock<Path> = std::sync::OnceLock::new();
@@ -452,7 +457,7 @@ pub fn path() -> Path {
                 Ok("0") => Path::F32,
                 Ok("scalar") => Path::Scalar,
                 #[cfg(target_arch = "x86_64")]
-                _ if x86() >= X86::Avx2 => Path::X86,
+                _ if x86() >= X86::Avx => Path::X86,
                 Ok("1") => Path::Scalar,
                 _ => Path::F32,
             })
@@ -460,7 +465,7 @@ pub fn path() -> Path {
         #[cfg(not(feature = "std"))]
         {
             #[cfg(target_arch = "x86_64")]
-            if x86() >= X86::Avx2 {
+            if x86() >= X86::Avx {
                 return Path::X86;
             }
             Path::F32
@@ -1823,6 +1828,10 @@ impl QuantF {
                 let mut o = vec![0f32; m * w];
                 #[cfg(target_arch = "x86_64")]
                 {
+                    #[target_feature(enable = "avx")]
+                    fn avx(q: &QuantF, a: &[f32], m: usize, bias: Option<&[f32]>, jp0: usize, jp1: usize, o: &mut [f32]) {
+                        q.panels_small(a, m, bias, jp0, jp1, o)
+                    }
                     #[target_feature(enable = "avx2,fma")]
                     fn avx2(q: &QuantF, a: &[f32], m: usize, bias: Option<&[f32]>, jp0: usize, jp1: usize, o: &mut [f32]) {
                         q.panels_small(a, m, bias, jp0, jp1, o)
@@ -1836,6 +1845,7 @@ impl QuantF {
                     match x86() {
                         X86::Avx512 => unsafe { avx512(self, a, m, bias, jp0, jp1, &mut o) },
                         X86::Avx2 => unsafe { avx2(self, a, m, bias, jp0, jp1, &mut o) },
+                        X86::Avx => unsafe { avx(self, a, m, bias, jp0, jp1, &mut o) },
                         X86::Sse2 => self.panels_small(a, m, bias, jp0, jp1, &mut o),
                     }
                 }
@@ -1934,7 +1944,7 @@ impl QuantF {
         let start = {
             let mut jp = jp0;
             let lvl = x86();
-            let pp = if m <= 2 && lvl >= X86::Avx2 { 4 } else if m <= 4 && lvl >= X86::Avx512 { 2 } else { 0 };
+            let pp = if m <= 2 && lvl >= X86::Avx { 4 } else if m <= 4 && lvl >= X86::Avx512 { 2 } else { 0 };
             if pp > 0 {
                 let zero = [0f32; 4 * NR];
                 while jp + pp <= jp1 && (jp + pp) * NR <= n {
@@ -1952,8 +1962,10 @@ impl QuantF {
                             (X86::Avx512, 3) => x86::q8p_avx512::<3, 2>(a.as_ptr(), k, q, sc, init.as_ptr(), op, w),
                             (X86::Avx512, 2) => x86::q8p_avx512::<2, 4>(a.as_ptr(), k, q, sc, init.as_ptr(), op, w),
                             (X86::Avx512, _) => x86::q8p_avx512::<1, 4>(a.as_ptr(), k, q, sc, init.as_ptr(), op, w),
-                            (_, 2) => x86::q8p_avx2::<2>(a.as_ptr(), k, q, sc, init.as_ptr(), op, w),
-                            _ => x86::q8p_avx2::<1>(a.as_ptr(), k, q, sc, init.as_ptr(), op, w),
+                            (X86::Avx2, 2) => x86::q8p_avx2::<2>(a.as_ptr(), k, q, sc, init.as_ptr(), op, w),
+                            (X86::Avx2, _) => x86::q8p_avx2::<1>(a.as_ptr(), k, q, sc, init.as_ptr(), op, w),
+                            (_, 2) => x86::q8p_avx::<2>(a.as_ptr(), k, q, sc, init.as_ptr(), op, w),
+                            _ => x86::q8p_avx::<1>(a.as_ptr(), k, q, sc, init.as_ptr(), op, w),
                         }
                     }
                     jp += pp;
@@ -2047,12 +2059,14 @@ impl Linear {
 // ---------------------------------------------------------------------------------------------- x86-64
 
 /// SIMD level of an x86-64 CPU, detected at run time: SSE2 (every x86-64; what the plain Rust auto-vectorizes to),
-/// AVX2 with FMA (Haswell, Zen 1 on), AVX-512 F/BW/DQ/VL (Skylake-X, Ice Lake, Zen 4 on). Every level computes the
-/// same products and sums in the same order: the same bits. std builds: TINYASR_X86=sse2|avx2 caps it (for tests).
+/// AVX without AVX2 (Sandy Bridge, Ivy Bridge, Bulldozer), AVX2 with FMA (Haswell, Zen 1 on), AVX-512 F/BW/DQ/VL
+/// (Skylake-X, Ice Lake, Zen 4 on). Every level computes the same products and sums in the same order: the same bits.
+/// std builds: TINYASR_X86=sse2|avx|avx2 caps it (for tests).
 #[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum X86 {
     Sse2,
+    Avx,
     Avx2,
     Avx512,
 }
@@ -2064,16 +2078,17 @@ pub fn x86() -> X86 {
     static L: AtomicU8 = AtomicU8::new(0);
     let v = L.load(Ordering::Relaxed);
     if v != 0 {
-        return [X86::Sse2, X86::Avx2, X86::Avx512][v as usize - 1];
+        return [X86::Sse2, X86::Avx, X86::Avx2, X86::Avx512][v as usize - 1];
     }
     #[cfg(feature = "std")]
     let l = {
         use std::arch::is_x86_feature_detected as has;
         let avx2 = has!("avx2") && has!("fma");
         let avx512 = avx2 && has!("avx512f") && has!("avx512bw") && has!("avx512dq") && has!("avx512vl");
-        let l = if avx512 { X86::Avx512 } else if avx2 { X86::Avx2 } else { X86::Sse2 };
+        let l = if avx512 { X86::Avx512 } else if avx2 { X86::Avx2 } else if has!("avx") { X86::Avx } else { X86::Sse2 };
         match std::env::var("TINYASR_X86").as_deref() {
             Ok("sse2") => X86::Sse2,
+            Ok("avx") => l.min(X86::Avx),
             Ok("avx2") => l.min(X86::Avx2),
             _ => l,
         }
@@ -2083,6 +2098,8 @@ pub fn x86() -> X86 {
         X86::Avx512
     } else if cfg!(all(target_feature = "avx2", target_feature = "fma")) {
         X86::Avx2
+    } else if cfg!(target_feature = "avx") {
+        X86::Avx
     } else {
         X86::Sse2
     };
@@ -2106,12 +2123,12 @@ impl ActX {
     fn new(a: &[f32], m: usize, k: usize, g: usize) -> ActX {
         let ng = k / g;
         let (mut q, mut s, mut sum) = (vec![0i8; m * k], vec![0f32; m * ng], vec![0i32; m * ng]);
-        if g.is_multiple_of(16) && x86() >= X86::Avx2 {
+        if g.is_multiple_of(16) && x86() >= X86::Avx {
             assert!(a.len() >= m * k);
             #[allow(unsafe_code)]
             // SAFETY: a holds m rows of k, q m x k, s and sum m x ng (just made); the level was detected on this CPU.
             unsafe {
-                if x86() >= X86::Avx512 { x86::act_avx512(a, m, k, g, &mut q, &mut s, &mut sum) } else { x86::act_avx2(a, m, k, g, &mut q, &mut s, &mut sum) }
+                if x86() >= X86::Avx512 { x86::act_avx512(a, m, k, g, &mut q, &mut s, &mut sum) } else { x86::act_avx(a, m, k, g, &mut q, &mut s, &mut sum) }
             }
             return ActX { q, s, sum, k, ng };
         }
@@ -2153,6 +2170,8 @@ impl ActX {
 #[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum IntX86 {
+    /// AVX without AVX2 (Sandy Bridge, Ivy Bridge, Bulldozer): `vpmaddubsw` + `vpmaddwd` on xmm.
+    Avx,
     /// AVX2: `vpmaddubsw` (unsigned weight x signed activation pairs into int16) + `vpmaddwd`.
     Avx2,
     /// AVX-VNNI (Alder Lake, Zen 5 on): `vpdpbusd` on ymm.
@@ -2172,20 +2191,24 @@ pub fn int_x86() -> IntX86 {
             let forced = std::env::var("TINYASR_INT_X86");
             if lvl >= X86::Avx512 && has!("avx512vnni") && forced.as_deref().is_err() {
                 IntX86::Avx512Vnni
-            } else if has!("avxvnni") && forced.as_deref() != Ok("avx2") {
+            } else if lvl >= X86::Avx2 && has!("avxvnni") && forced.as_deref() != Ok("avx2") {
                 IntX86::AvxVnni
-            } else {
+            } else if lvl >= X86::Avx2 {
                 IntX86::Avx2
+            } else {
+                IntX86::Avx
             }
         })
     }
     #[cfg(not(feature = "std"))]
     if cfg!(all(target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq", target_feature = "avx512vl", target_feature = "avx512vnni")) {
         IntX86::Avx512Vnni
-    } else if cfg!(target_feature = "avxvnni") {
+    } else if cfg!(all(target_feature = "avxvnni", target_feature = "avx2", target_feature = "fma")) {
         IntX86::AvxVnni
-    } else {
+    } else if cfg!(all(target_feature = "avx2", target_feature = "fma")) {
         IntX86::Avx2
+    } else {
+        IntX86::Avx
     }
 }
 
@@ -2195,9 +2218,9 @@ mod x86 {
     use super::NR;
     use core::arch::x86_64::*;
 
-    /// `kernel` on AVX2: R rows x 16 columns in 2R ymm accumulators; product, then sum (not fused): the same bits.
+    /// `kernel` on AVX: R rows x 16 columns in 2R ymm accumulators; product, then sum (not fused): the same bits.
     #[inline(always)]
-    unsafe fn kernel_avx2<const R: usize>(a: *const f32, k: usize, panel: *const f32, init: &[f32; NR], out: &mut [[f32; NR]]) {
+    unsafe fn kernel_avx<const R: usize>(a: *const f32, k: usize, panel: *const f32, init: &[f32; NR], out: &mut [[f32; NR]]) {
         // SAFETY: the caller's a holds R rows of k, panel k x 16, out R rows.
         unsafe {
             let start = [_mm256_loadu_ps(init.as_ptr()), _mm256_loadu_ps(init.as_ptr().add(8))];
@@ -2221,7 +2244,7 @@ mod x86 {
     /// `kernel` on AVX-512: R rows x 16 columns, one zmm accumulator per row.
     #[inline(always)]
     unsafe fn kernel_avx512<const R: usize>(a: *const f32, k: usize, panel: *const f32, init: &[f32; NR], out: &mut [[f32; NR]]) {
-        // SAFETY: as `kernel_avx2`.
+        // SAFETY: as `kernel_avx`.
         unsafe {
             let mut acc = [_mm512_loadu_ps(init.as_ptr()); R];
             for p in 0..k {
@@ -2262,7 +2285,7 @@ mod x86 {
             }
         };
     }
-    rows!(rows_avx2, "avx2,fma", kernel_avx2, 6, 1 2 3 4 5 6);
+    rows!(rows_avx, "avx", kernel_avx, 6, 1 2 3 4 5 6);
     rows!(rows_avx512, "avx512f,avx512bw,avx512dq,avx512vl,avx2,fma", kernel_avx512, 12, 1 2 3 4 5 6 7 8 9 10 11 12);
 
     /// One 64-byte block of an integer panel (8 outputs x 8 bytes, in pairs [output 2p | output 2p + 1]) transposed:
@@ -2506,9 +2529,9 @@ mod x86 {
         }
     }
 
-    /// `act_avx512` on AVX2.
-    #[target_feature(enable = "avx2,fma")]
-    pub unsafe fn act_avx2(a: &[f32], m: usize, k: usize, g: usize, q: &mut [i8], s: &mut [f32], sum: &mut [i32]) {
+    /// `act_avx512` on AVX (integer steps on xmm halves).
+    #[target_feature(enable = "avx")]
+    pub unsafe fn act_avx(a: &[f32], m: usize, k: usize, g: usize, q: &mut [i8], s: &mut [f32], sum: &mut [i32]) {
         let ng = k / g;
         assert!(g.is_multiple_of(16) && a.len() >= m * k && q.len() >= m * k && s.len() >= m * ng && sum.len() >= m * ng);
         // SAFETY: as `act_avx512`.
@@ -2530,20 +2553,21 @@ mod x86 {
                 let max = _mm_cvtss_f32(_mm_max_ss(m2, _mm_shuffle_ps::<1>(m2, m2)));
                 let inv = if max > 0.0 { 127.0 / max } else { 0.0 };
                 let vi = _mm256_set1_ps(inv);
-                let mut sm = _mm256_setzero_si256();
+                let mut s4 = _mm_setzero_si128();
                 for j in (0..g).step_by(16) {
-                    let t: [__m256i; 2] = core::array::from_fn(|h| {
+                    // codes 0..4, 4..8, 8..12, 12..16
+                    let mut t = [_mm_setzero_si128(); 4];
+                    for h in 0..2 {
                         let r = _mm256_mul_ps(_mm256_loadu_ps(x.add(j + 8 * h)), vi);
-                        _mm256_cvttps_epi32(_mm256_add_ps(r, _mm256_or_ps(half, _mm256_and_ps(r, sign))))
-                    });
-                    sm = _mm256_add_epi32(sm, _mm256_add_epi32(t[0], t[1]));
-                    // int32 -> int16 (lanes interleaved per 128 bits, put back in order) -> int8; |t| <= 127
-                    let p16 = _mm256_permute4x64_epi64::<0b11_01_10_00>(_mm256_packs_epi32(t[0], t[1]));
-                    let p8 = _mm_packs_epi16(_mm256_castsi256_si128(p16), _mm256_extracti128_si256::<1>(p16));
+                        let c = _mm256_cvttps_epi32(_mm256_add_ps(r, _mm256_or_ps(half, _mm256_and_ps(r, sign))));
+                        (t[2 * h], t[2 * h + 1]) = (_mm256_castsi256_si128(c), _mm256_extractf128_si256::<1>(c));
+                    }
+                    s4 = _mm_add_epi32(s4, _mm_add_epi32(_mm_add_epi32(t[0], t[1]), _mm_add_epi32(t[2], t[3])));
+                    // int32 -> int16 -> int8; |t| <= 127
+                    let p8 = _mm_packs_epi16(_mm_packs_epi32(t[0], t[1]), _mm_packs_epi32(t[2], t[3]));
                     _mm_storeu_si128(qp.add(i * g + j) as *mut _, p8);
                 }
                 *s.get_unchecked_mut(i) = max / 127.0;
-                let s4 = _mm_add_epi32(_mm256_castsi256_si128(sm), _mm256_extracti128_si256::<1>(sm));
                 let s2 = _mm_add_epi32(s4, _mm_unpackhi_epi64(s4, s4));
                 *sum.get_unchecked_mut(i) = _mm_cvtsi128_si32(_mm_add_epi32(s2, _mm_shuffle_epi32::<1>(s2)));
             }
@@ -2575,14 +2599,34 @@ mod x86 {
         }
     }
 
-    /// `q8p_avx512` (P = 4) on AVX2: every NR = 16 columns as two halves of 8.
+    /// `q8p256` on AVX2.
     #[target_feature(enable = "avx2,fma")]
     pub unsafe fn q8p_avx2<const R: usize>(a: *const f32, k: usize, q: *const i8, sc: *const f32, init: *const f32, o: *mut f32, stride: usize) {
-        // SAFETY: the caller's bounds (see the call).
+        // SAFETY: the caller's bounds; AVX2 enabled here.
+        unsafe { q8p256::<R, true>(a, k, q, sc, init, o, stride) }
+    }
+
+    /// `q8p256` on AVX without AVX2.
+    #[target_feature(enable = "avx")]
+    pub unsafe fn q8p_avx<const R: usize>(a: *const f32, k: usize, q: *const i8, sc: *const f32, init: *const f32, o: *mut f32, stride: usize) {
+        // SAFETY: the caller's bounds.
+        unsafe { q8p256::<R, false>(a, k, q, sc, init, o, stride) }
+    }
+
+    /// `q8p_avx512` (P = 4) on ymm: every NR = 16 columns as two halves of 8, the codes widened by AVX2 or in two
+    /// SSE4.1 halves.
+    #[inline(always)]
+    unsafe fn q8p256<const R: usize, const AVX2: bool>(a: *const f32, k: usize, q: *const i8, sc: *const f32, init: *const f32, o: *mut f32, stride: usize) {
+        // SAFETY: the caller's bounds (see the call); AVX2 intrinsics only when the caller enables AVX2.
         unsafe {
+            let widen = |p: *const i8| {
+                let v = _mm_loadl_epi64(p as *const _);
+                let i = if AVX2 { _mm256_cvtepi8_epi32(v) } else { _mm256_set_m128i(_mm_cvtepi8_epi32(_mm_srli_si128::<4>(v)), _mm_cvtepi8_epi32(v)) };
+                _mm256_cvtepi32_ps(i)
+            };
             let mut acc = [[_mm256_setzero_ps(); 8]; R];
             for p in 0..k {
-                let b: [__m256; 8] = core::array::from_fn(|h| _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(q.add(((h / 2) * k + p) * NR + 8 * (h % 2)) as *const _))));
+                let b: [__m256; 8] = core::array::from_fn(|h| widen(q.add(((h / 2) * k + p) * NR + 8 * (h % 2))));
                 for r in 0..R {
                     let x = _mm256_set1_ps(*a.add(r * k + p));
                     for h in 0..8 {
@@ -2829,6 +2873,87 @@ mod x86 {
         }
     }
 
+    /// The int32 lane pairs of one output pair (the 16-byte quarter of each block at `wq`) over blocks b0..b1, for R
+    /// rows of codes at `aq` (k apart): `int256`'s integer steps on xmm.
+    #[inline(always)]
+    unsafe fn pair128<const R: usize, const INT4: bool>(aq: *const i8, k: usize, wq: *const u8, b0: usize, b1: usize) -> [__m128i; R] {
+        let ks = if INT4 { 16 } else { 8 };
+        // SAFETY: the caller's aq holds R rows of k codes and wq the blocks b0..b1 (64 bytes apart).
+        unsafe {
+            let (m0f, m88, ones) = (_mm_set1_epi8(0x0f), _mm_set1_epi8(0x88u8 as i8), _mm_set1_epi16(1));
+            // a row's 8 codes at kk in both 64-bit lanes
+            let a8 = |r: usize, kk: usize| _mm_set1_epi64x((aq.add(r * k + kk) as *const i64).read_unaligned());
+            let mut acc = [_mm_setzero_si128(); R];
+            let mut b = b0;
+            while b < b1 {
+                if INT4 {
+                    // `vpmaddubsw` sums kept in int16 over up to 4 blocks, as `int256`
+                    let be = (b + 4).min(b1);
+                    let mut s16 = [_mm_setzero_si128(); R];
+                    for b in b..be {
+                        let v = _mm_xor_si128(_mm_loadu_si128(wq.add(b * 64) as *const _), m88);
+                        let (lo, hi) = (_mm_and_si128(v, m0f), _mm_and_si128(_mm_srli_epi16::<4>(v), m0f));
+                        for r in 0..R {
+                            let p = _mm_add_epi16(_mm_maddubs_epi16(lo, a8(r, b * ks)), _mm_maddubs_epi16(hi, a8(r, b * ks + 8)));
+                            s16[r] = _mm_add_epi16(s16[r], p);
+                        }
+                    }
+                    for r in 0..R {
+                        acc[r] = _mm_add_epi32(acc[r], _mm_madd_epi16(s16[r], ones));
+                    }
+                    b = be;
+                } else {
+                    // `dp8`: |w| x (a with w's sign)
+                    let v = _mm_loadu_si128(wq.add(b * 64) as *const _);
+                    let va = _mm_abs_epi8(v);
+                    for r in 0..R {
+                        acc[r] = _mm_add_epi32(acc[r], _mm_madd_epi16(_mm_maddubs_epi16(va, _mm_sign_epi8(a8(r, b * ks), v)), ones));
+                    }
+                    b += 1;
+                }
+            }
+            acc
+        }
+    }
+
+    /// `int256` (plain AVX2) on xmm, for AVX without AVX2: a 16-byte quarter of a block is one output pair, so per row
+    /// and half of the panel (outputs 0..4, 4..8) the integer sums of its two pairs, then one float step.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn int128<const R: usize, const INT4: bool, const _V: bool>(act: &super::ActX, r0: usize, w: *const u8, sw: *const f32, g: usize, o: *mut f32, stride: usize, init: *const f32, c: usize) {
+        let (k, ng) = (act.k, act.ng);
+        let nb = g / if INT4 { 16 } else { 8 };
+        // SAFETY: as `int512`.
+        unsafe {
+            let aq = act.q.as_ptr().add(r0 * k);
+            let mut f = [[_mm_setzero_ps(); 2]; R];
+            for c in 0..ng {
+                for half in 0..2 {
+                    let acc: [[__m128i; R]; 2] = core::array::from_fn(|pair| pair128::<R, INT4>(aq, k, w.add(16 * (2 * half + pair)), c * nb, (c + 1) * nb));
+                    let sw4 = _mm_loadu_ps(sw.add(c * 8 + 4 * half));
+                    for r in 0..R {
+                        // lane pairs added: outputs 4 half .. 4 half + 4 in order
+                        let d = _mm_hadd_epi32(acc[0][r], acc[1][r]);
+                        let i = (r0 + r) * ng + c;
+                        // `step`; int8 (`dp8`) works on the codes themselves: no offset
+                        let d = if INT4 { _mm_slli_epi32::<4>(_mm_sub_epi32(d, _mm_set1_epi32(8 * *act.sum.as_ptr().add(i)))) } else { d };
+                        let s = _mm_mul_ps(_mm_set1_ps(*act.s.as_ptr().add(i)), sw4);
+                        f[r][half] = _mm_add_ps(f[r][half], _mm_mul_ps(_mm_cvtepi32_ps(d), s));
+                    }
+                }
+            }
+            // + bias, the first c columns of rows r0.. (o at row r0)
+            let mut t = [0f32; 8];
+            for r in 0..R {
+                _mm_storeu_ps(t.as_mut_ptr(), f[r][0]);
+                _mm_storeu_ps(t.as_mut_ptr().add(4), f[r][1]);
+                for j in 0..c {
+                    *o.add(r * stride + j) = t[j] + *init.add(j);
+                }
+            }
+        }
+    }
+
     /// `kern::<rows, int4, extra...>(args)` for rows 1..=8.
     macro_rules! int_rows {
         ($rows:expr, $int4:expr, $kern:ident, $v:tt, $args:tt) => {
@@ -2931,6 +3056,7 @@ mod x86 {
             }
             super::IntX86::AvxVnni => drive!(dvnni, "avxvnni,avx2,fma", int256, true, 4),
             super::IntX86::Avx2 => drive!(d256, "avx2,fma", int256, false, 4),
+            super::IntX86::Avx => drive!(d128, "avx", int128, false, 4),
         }
     }
 
@@ -3082,18 +3208,21 @@ mod tests {
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     #[test]
     fn x86_int_same_bits() {
-        if x86() < X86::Avx2 {
+        if x86() < X86::Avx {
             return;
         }
-        let mut kerns = vec![IntX86::Avx2];
-        if std::arch::is_x86_feature_detected!("avxvnni") {
-            kerns.push(IntX86::AvxVnni);
+        let mut kerns = vec![IntX86::Avx];
+        if x86() >= X86::Avx2 {
+            kerns.push(IntX86::Avx2);
+            if std::arch::is_x86_feature_detected!("avxvnni") {
+                kerns.push(IntX86::AvxVnni);
+            }
         }
         if x86() >= X86::Avx512 && std::arch::is_x86_feature_detected!("avx512vnni") {
             kerns.push(IntX86::Avx512Vnni);
         }
         let mut seed = 13;
-        for &(m, n, k, g, int4) in &[(1, 8, 64, 64, true), (5, 19, 128, 64, true), (33, 40, 512, 64, true), (3, 13, 512, 512, false), (36, 24, 96, 32, false), (2, 7, 32, 16, true), (17, 70, 1152, 1152, true), (9, 16, 64, 32, false), (1, 32, 512, 512, false), (2, 24, 1024, 64, true), (1, 40, 96, 32, false), (2, 16, 48, 48, true)] {
+        for &(m, n, k, g, int4) in &[(1, 8, 64, 64, true), (5, 19, 128, 64, true), (33, 40, 512, 64, true), (3, 13, 512, 512, false), (36, 24, 96, 32, false), (2, 7, 32, 16, true), (17, 70, 1152, 1152, true), (9, 16, 64, 32, false), (1, 32, 512, 512, false), (2, 24, 1024, 64, true), (1, 40, 96, 32, false), (2, 16, 48, 48, true), (3, 9, 160, 80, true), (7, 21, 192, 96, true), (2, 11, 64, 32, false)] {
             let codes: Vec<i8> = (0..n * k).map(|_| (rnd(&mut seed) * if int4 { 8.0 } else { 128.0 }).floor().clamp(if int4 { -8.0 } else { -128.0 }, if int4 { 7.0 } else { 127.0 }) as i8).collect();
             let scales: Vec<f32> = (0..n * k / g).map(|_| 0.01 + rnd(&mut seed).abs() * 0.05).collect();
             let q = Quant::new(n, k, g, int4, |j, p| codes[j * k + p], |j, c| scales[j * (k / g) + c]);
@@ -3155,13 +3284,13 @@ mod tests {
         for &(m, k, g) in &[(1, 64, 16), (3, 384, 64), (5, 512, 512), (2, 96, 32), (4, 1152, 1152)] {
             let a: Vec<f32> = (0..m * k).map(|i| if i % 37 == 5 { 0.0 } else if i % 41 == 7 { -0.0 } else { rnd(&mut seed) * if i % 3 == 0 { 0.01 } else { 4.0 } }).collect();
             let ng = k / g;
-            for lvl in [X86::Avx2, X86::Avx512] {
+            for lvl in [X86::Avx, X86::Avx512] {
                 if x86() < lvl {
                     continue;
                 }
                 let (mut q, mut s, mut sum) = (vec![0i8; m * k], vec![0f32; m * ng], vec![0i32; m * ng]);
                 unsafe {
-                    if lvl == X86::Avx512 { x86::act_avx512(&a, m, k, g, &mut q, &mut s, &mut sum) } else { x86::act_avx2(&a, m, k, g, &mut q, &mut s, &mut sum) }
+                    if lvl == X86::Avx512 { x86::act_avx512(&a, m, k, g, &mut q, &mut s, &mut sum) } else { x86::act_avx(&a, m, k, g, &mut q, &mut s, &mut sum) }
                 }
                 for i in 0..m * ng {
                     let x = &a[i * g..(i + 1) * g];
@@ -3310,15 +3439,49 @@ mod tests {
                 let mut want = vec![0f32; m * stride];
                 rows(&a, k, &panel, &init, &mut want, stride, cols);
                 let mut got = vec![0f32; m * stride];
-                if lvl >= X86::Avx2 {
-                    unsafe { x86::rows_avx2(&a, k, &panel, &init, &mut got, stride, cols) };
-                    assert!(got == want, "avx2 m{m} k{k}");
+                if lvl >= X86::Avx {
+                    unsafe { x86::rows_avx(&a, k, &panel, &init, &mut got, stride, cols) };
+                    assert!(got == want, "avx m{m} k{k}");
                 }
                 if lvl >= X86::Avx512 {
                     got.fill(0.0);
                     unsafe { x86::rows_avx512(&a, k, &panel, &init, &mut got, stride, cols) };
                     assert!(got == want, "avx512 m{m} k{k}");
                 }
+            }
+        }
+        // `QuantF`, one or two rows, four panels at a time: the bits of `kernel_q8`
+        for &(m, k) in &[(1, 64), (2, 100), (2, 512)] {
+            let n = 4 * NR;
+            let codes: Vec<i8> = (0..n * k).map(|_| (rnd(&mut seed) * 127.0) as i8).collect();
+            let sc: Vec<f32> = (0..n).map(|_| 0.01 + rnd(&mut seed).abs()).collect();
+            let q = QuantF::new(n, k, |j, p| codes[j * k + p], |j| sc[j]);
+            let a: Vec<f32> = (0..m * k).map(|_| rnd(&mut seed)).collect();
+            let bias: Vec<f32> = (0..n).map(|_| rnd(&mut seed)).collect();
+            let mut want = vec![0f32; m * n];
+            for jp in 0..4 {
+                let (s, init) = (q.s[jp * NR..(jp + 1) * NR].try_into().unwrap(), bias[jp * NR..(jp + 1) * NR].try_into().unwrap());
+                for r in 0..m {
+                    let mut t = [[0f32; NR]; 1];
+                    kernel_q8::<1>(&a[r * k..(r + 1) * k], k, &q.q[jp * k * NR..(jp + 1) * k * NR], s, init, &mut t);
+                    want[r * n + jp * NR..r * n + (jp + 1) * NR].copy_from_slice(&t[0]);
+                }
+            }
+            for l in [X86::Avx, X86::Avx2] {
+                if lvl < l {
+                    continue;
+                }
+                let mut got = vec![0f32; m * n];
+                let (ap, qp, sp, bp, op) = (a.as_ptr(), q.q.as_ptr(), q.s.as_ptr(), bias.as_ptr(), got.as_mut_ptr());
+                unsafe {
+                    match (l, m) {
+                        (X86::Avx, 1) => x86::q8p_avx::<1>(ap, k, qp, sp, bp, op, n),
+                        (X86::Avx, _) => x86::q8p_avx::<2>(ap, k, qp, sp, bp, op, n),
+                        (_, 1) => x86::q8p_avx2::<1>(ap, k, qp, sp, bp, op, n),
+                        _ => x86::q8p_avx2::<2>(ap, k, qp, sp, bp, op, n),
+                    }
+                }
+                assert!(got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()), "q8p {l:?} m{m} k{k}");
             }
         }
         // integer weights widened in registers: the bits of the f32 panels
