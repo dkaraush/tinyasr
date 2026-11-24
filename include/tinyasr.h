@@ -17,7 +17,8 @@ typedef struct tinyasr_models tinyasr_models;
 typedef struct tinyasr_session tinyasr_session;
 typedef struct tinyasr_file tinyasr_file;
 
-/* Version of the library (its API and the model files it reads): 5. Reads TZF5 model files (which may give the first
+/* Version of the library (its API and the model files it reads): 6. Reads TZF6 model files (whose languages carry their
+ * writing rules: timed units per character for Chinese, its own sentence ends 。？！), TZF5 files (which may give the first
  * token block to the first language alone, for a model without English such as fr-de), TZF4 files (TZF3 plus a
  * per-language decoder vector, so a dialect code shapes the output), TZF3 files, which name their languages, and the
  * TZF1 / TZF2 files of version 2. Language codes are matched case-insensitively. */

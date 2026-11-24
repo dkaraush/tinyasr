@@ -5,7 +5,7 @@ use crate::compat::F64Ext;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::model::Token;
+use crate::model::{LangInfo, Token, Units};
 
 /// A word with the times (s) of its first and last token; `tw`: of its last token with a letter or digit (the model
 /// often writes trailing punctuation only once it has heard the pause after it); `lp`: log-probability of the last
@@ -48,13 +48,29 @@ pub fn words(pieces: &[String], tk: &[Token], t0: f64) -> Vec<W> {
     out
 }
 
-/// Khmer writes no spaces inside a phrase, so a "word" can be a whole phrase: split each word with Khmer letters into
-/// syllables, each timed by the tokens it falls in. First clusters (a consonant or independent vowel with its coeng
+/// Timed units inside words, as the model file says for the language ([`Units`]): whole words; one per character
+/// (Chinese: [`char_units`]); or Khmer syllables. Khmer writes no spaces inside a phrase, so a "word" can be a whole
+/// phrase: split each word with Khmer letters into syllables, each timed by the tokens it falls in. First clusters (a consonant or independent vowel with its coeng
 /// subscripts and signs; ៗ ។ and closing punctuation stay with the cluster before; a Latin or digit run is one unit),
 /// then, from the right, a bare consonant cluster (no vowel sign, no subscript) becomes the final consonant of the
 /// syllable before it when that one has none yet: ម|ក|ដ|ល់ -> មក|ដល់, ម្ម|ក|រ -> ម្ម|ករ. Units after the first of a
 /// word have `join` (no space before). Other words pass unchanged.
-pub fn units(ws: Vec<W>) -> Vec<W> {
+pub fn units(ws: Vec<W>, mode: Units) -> Vec<W> {
+    match mode {
+        Units::Word => ws,
+        Units::Char => {
+            let mut out = Vec::with_capacity(ws.len());
+            for w in ws {
+                if w.w.chars().any(wide) { char_units(w, &mut out) } else { out.push(w) }
+            }
+            out
+        }
+        Units::Khmer => khmer_units(ws),
+    }
+}
+
+/// Khmer syllables (see [`units`]).
+fn khmer_units(ws: Vec<W>) -> Vec<W> {
     let khmer = |c: char| ('\u{1780}'..='\u{17FF}').contains(&c);
     let latin = |c: char| c.is_ascii_alphanumeric() || c.is_alphabetic() && !khmer(c);
     let mut out = Vec::with_capacity(ws.len());
@@ -114,6 +130,40 @@ pub fn units(ws: Vec<W>) -> Vec<W> {
     out
 }
 
+/// A letter of a script written without spaces, one unit per character (CJK ideographs, kana and later blocks).
+fn wide(c: char) -> bool {
+    c >= '\u{2E80}' && c.is_alphabetic()
+}
+
+/// No spaces (Chinese, [`Units::Char`]): each character is a unit, timed by the token it falls in; a run of other
+/// letters or digits (with . , : % inside or after it) is one unit; punctuation stays with the unit before, an opening
+/// quote or bracket goes with the unit after. Units after the first of a word have `join`.
+fn char_units(w: W, out: &mut Vec<W>) {
+    let ch: Vec<(usize, char)> = w.w.char_indices().collect();
+    let run = |c: char| c.is_alphanumeric() && !wide(c);
+    let opening = |c: char| matches!(c, '«' | '“' | '「' | '『' | '《' | '(' | '（' | '"');
+    let mut cl: Vec<(usize, usize)> = Vec::new();
+    let mut a = 0;
+    for i in 1..=ch.len() {
+        let new = i == ch.len() || {
+            let (c, p) = (ch[i].1, ch[i - 1].1);
+            !opening(p)
+                && (wide(c) || opening(c) || run(c) && !(run(p) || matches!(p, '.' | ',' | ':' | '\'' | '-' | '%')))
+        };
+        if new {
+            cl.push((a, i));
+            a = i;
+        }
+    }
+    let time = |bt: usize| w.ts.iter().rev().find(|(o, _)| *o <= bt).map_or(w.t, |x| x.1);
+    for (k, &(x, y)) in cl.iter().enumerate() {
+        let (b0, b1) = (ch[x].0, ch[y - 1].0);
+        let end = if y < ch.len() { ch[y].0 } else { w.w.len() };
+        let (t, te) = (time(b0), time(b1));
+        out.push(W { w: w.w[b0..end].into(), t, te, tw: te, lp: w.lp, ts: alloc::vec![(0, t)], join: k > 0 || w.join });
+    }
+}
+
 /// Word times (s) for the output, from emission times. A transducer writes a word as its sound ends, not as it begins
 /// (its first emission is ~0.2–0.4 s after the word's start): so a word ends at its last emission and begins where the
 /// previous word ended (`from` for the first), with the unvoiced frames at both ends cut off — a word after a pause
@@ -169,10 +219,11 @@ pub fn heard_until(w: &mut W, t: f64) {
 /// How late the transducer writes a word after its sound (s): measured on FLEURS against the speech's own starts and ends.
 const LAG: f64 = 0.32;
 
-/// Ends a sentence: . ? ! … (Khmer ។, Persian ؟) optionally followed by a closing quote.
-pub fn is_end(w: &str) -> bool {
+/// Ends a sentence: . ? ! … (Khmer ។, Persian ؟) or one of the language's own ends from the model file
+/// ("lang.K.ends", Chinese 。？！), optionally followed by a closing quote.
+pub fn is_end(w: &str, lang: &LangInfo) -> bool {
     let w = w.strip_suffix(['"', '»']).unwrap_or(w);
-    w.ends_with(['.', '?', '!', '…', '។', '؟'])
+    w.ends_with(['.', '?', '!', '…', '។', '؟']) || w.chars().next_back().is_some_and(|c| lang.ends.contains(c))
 }
 
 /// The full stop a sentence gets when the model wrote none (the language's, from the model file).
@@ -189,9 +240,10 @@ pub fn show_quotes(w: String, lang: &crate::model::LangInfo) -> String {
     }
 }
 
-/// Without trailing , ; : — – - (Persian ، ؛)
-pub fn trim_trail(w: &str) -> &str {
-    w.trim_end_matches([',', ';', ':', '—', '–', '-', '،', '؛'])
+/// Without trailing , ; : — – - (Persian ، ؛) or the language's own marks from the model file ("lang.K.trim",
+/// Chinese ，、；：).
+pub fn trim_trail<'a>(w: &'a str, lang: &LangInfo) -> &'a str {
+    w.trim_end_matches(|c: char| matches!(c, ',' | ';' | ':' | '—' | '–' | '-' | '،' | '؛') || lang.trim.contains(c))
 }
 
 /// The first letter in upper case (not after a digit: "20th").
@@ -284,6 +336,11 @@ mod tests {
     fn caps() {
         assert_eq!(cap("20th"), "20th");
         assert_eq!(cap("«привет»"), "«Привет»");
-        assert!(is_end("конец.»") && is_end("да?") && !is_end("так,"));
+        let ru = LangInfo::new("ru");
+        assert!(is_end("конец.»", &ru) && is_end("да?", &ru) && !is_end("так,", &ru));
+        let mut zh = LangInfo::new("zh");
+        zh.ends = "。？！".into();
+        zh.trim = "，、；：".into();
+        assert!(is_end("好的。", &zh) && !is_end("好的。", &ru) && trim_trail("然后，", &zh) == "然后");
     }
 }

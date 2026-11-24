@@ -64,11 +64,12 @@ pub const SAMPLE_RATE: u32 = 16_000;
 /// Beam width of the full-context pass unless the host sets one ([`Options::beam`], [`Transcription::new`]); 1 is greedy.
 pub const DEFAULT_BEAM: usize = 4;
 
-/// Version of the library (its API and the model files it reads: TZF5, which may give the first token block to the
+/// Version of the library (its API and the model files it reads: TZF6, whose languages carry their writing rules
+/// (timed units per character for Chinese, its own sentence ends); TZF5, which may give the first token block to the
 /// first language alone (a model without English); TZF4, TZF3 plus a per-language decoder vector so a dialect code
 /// shapes the output; TZF3, which names its languages; the older TZF1/TZF2); C: `tinyasr_version()`.
 pub fn version() -> u32 {
-    5
+    6
 }
 
 /// The languages a recognition may use, as the host allows them (codes, any case: BCP 47 tags are case-insensitive;
@@ -82,7 +83,7 @@ fn allowed(m: &Models, langs: &[&str]) -> Vec<usize> {
 }
 
 /// A recognized word: its text (with punctuation) and times (s from the start of the audio). `join`: written without a
-/// space before it (Khmer: a word is cut into syllables, each with its own times).
+/// space before it (Khmer: a word is cut into syllables, Chinese into characters, each with its own times).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Word {
     pub text: String,

@@ -3100,7 +3100,7 @@ mod tests {
             let a: Vec<f32> = (0..m * k).map(|i| if i % 97 == 3 { 0.0 } else { rnd(&mut seed) * 3.0 }).collect();
             let bias: Vec<f32> = (0..n).map(|_| rnd(&mut seed)).collect();
             // the portable product, kernel call by kernel call
-            let act = pack_act(&a, m, k, g, false);
+            let act = pack_act(&a, m, k, g);
             let (pb, ng) = (q.panel_bytes(), k / g);
             let mut want = vec![0f32; m * n];
             for p in 0..m.div_ceil(2) {

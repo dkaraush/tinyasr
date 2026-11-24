@@ -74,7 +74,7 @@ impl<'m> Transcription<'m> {
     /// The words out, timed by [`spans`] from the last word given out.
     fn out(&mut self, ws: &[W]) -> Vec<Word> {
         let vf = &self.vf;
-        let ws = if self.m.asr.langs[self.lang].syllables { units(ws.to_vec()) } else { ws.to_vec() }; // Khmer: timed syllables
+        let ws = units(ws.to_vec(), self.m.asr.langs[self.lang].units); // Khmer syllables, Chinese characters
         let sp = spans(&ws, self.last_end, |f| usize::try_from(f).ok().and_then(|i| vf.get(i).copied()));
         if let Some(&(_, e)) = sp.last() {
             self.last_end = e as f64;
@@ -161,8 +161,8 @@ impl Transcription<'_> {
                 // a sentence end or the end of the audio
                 if end {
                     if let Some(last) = ws.last_mut() {
-                        if !is_end(&last.w) {
-                            last.w = format!("{}{}", trim_trail(&last.w), end_mark(&self.m.asr.langs[self.lang]));
+                        if !is_end(&last.w, &self.m.asr.langs[self.lang]) {
+                            last.w = format!("{}{}", trim_trail(&last.w, &self.m.asr.langs[self.lang]), end_mark(&self.m.asr.langs[self.lang]));
                         }
                     }
                 } else if last && ws.last().is_some_and(|w| open_end(&w.w, &self.m.asr.langs[self.lang])) {
@@ -177,7 +177,7 @@ impl Transcription<'_> {
                     }
                 }
                 (ws.len(), b, 0)
-            } else if let Some(j) = (0..ws.len() - 1).rev().find(|&j| is_end(&ws[j].w)) {
+            } else if let Some(j) = (0..ws.len() - 1).rev().find(|&j| is_end(&ws[j].w, &self.m.asr.langs[self.lang])) {
                 (j + 1, cut(&ws, j), (SR / FR) as usize)
             } else {
                 let j = longest_pause(&ws).unwrap_or(ws.len() - 2);
@@ -190,7 +190,7 @@ impl Transcription<'_> {
             if ws.is_empty() {
                 continue;
             }
-            let ended = is_end(&ws[ws.len() - 1].w);
+            let ended = is_end(&ws[ws.len() - 1].w, &self.m.asr.langs[self.lang]);
             if self.ended {
                 ws[0].w = cap(&ws[0].w);
             }

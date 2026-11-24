@@ -190,11 +190,9 @@ impl<'m> Session<'m> {
     /// Words out with the given texts, timed by [`spans`] from `from` (s).
     fn out(&self, ws: &[W], texts: impl Iterator<Item = String>, from: f64) -> Vec<Word> {
         let f0 = self.aud0 / FR;
-        // the given texts (capitals) on the words; Khmer words cut into timed syllables
+        // the given texts (capitals) on the words; Khmer words cut into timed syllables, Chinese into characters
         let mut ws: Vec<W> = ws.iter().zip(texts).map(|(w, text)| W { w: text, ..w.clone() }).collect();
-        if self.m.asr.langs[self.lang].syllables {
-            ws = units(ws);
-        }
+        ws = units(ws, self.m.asr.langs[self.lang].units);
         let sp = spans(&ws, from, |f| usize::try_from(f - f0).ok().and_then(|i| self.vf.get(i).copied()));
         ws.into_iter().zip(sp).map(|(w, (start, end))| Word { text: show_quotes(w.w, &self.m.asr.langs[self.lang]), start, end, join: w.join }).collect()
     }
@@ -344,7 +342,7 @@ impl<'m> Session<'m> {
             keep.extend(open);
             open = keep;
         }
-        let ends = open.iter().filter(|w| is_end(&w.w)).map(|w| (w.te, norm(&w.w))).collect();
+        let ends = open.iter().filter(|w| is_end(&w.w, &self.m.asr.langs[self.lang])).map(|w| (w.te, norm(&w.w))).collect();
         self.prev_ends = core::mem::replace(&mut self.open_ends, ends);
         self.open = open;
         self.full_at = b * FR;
@@ -368,7 +366,7 @@ impl<'m> Session<'m> {
             self.last_end = w.end as f64;
         }
         self.ev.push(Event::Commit(words));
-        self.ended = is_end(&self.open[n - 1].w);
+        self.ended = is_end(&self.open[n - 1].w, &self.m.asr.langs[self.lang]);
         let b = (cut as f64 / FR as f64).round() as i64 * FR;
         self.open.drain(..n);
         self.open0 = b;
@@ -386,7 +384,7 @@ impl<'m> Session<'m> {
         // a sentence end that the next sentence has already followed, once the re-decode heard SURE of audio after it
         // and the one before wrote it there too (one over a short stretch can end a sentence at a pause that more
         // audio shows to go on; the open text is on screen either way)
-        if let Some(j) = (0..ws.len().saturating_sub(1)).rev().find(|&j| is_end(&ws[j].w)) {
+        if let Some(j) = (0..ws.len().saturating_sub(1)).rev().find(|&j| is_end(&ws[j].w, &self.m.asr.langs[self.lang])) {
             let heard = (self.full_at as f64 / SR as f64 - ws[j].te) >= SURE;
             if !heard || !self.prev_ends.iter().any(|(te, w)| (te - ws[j].te).abs() < 0.12 && *w == norm(&ws[j].w)) {
                 return;
@@ -420,8 +418,8 @@ impl<'m> Session<'m> {
         self.unfinished = false;
         self.turn0 = self.pos;
         let Some(last) = self.open.last_mut() else { return };
-        if !is_end(&last.w) {
-            last.w = format!("{}{}", trim_trail(&last.w), end_mark(&self.m.asr.langs[self.lang]));
+        if !is_end(&last.w, &self.m.asr.langs[self.lang]) {
+            last.w = format!("{}{}", trim_trail(&last.w, &self.m.asr.langs[self.lang]), end_mark(&self.m.asr.langs[self.lang]));
         }
         self.freeze(self.open.len(), self.pos - FR, 0);
     }
@@ -575,12 +573,12 @@ pub(crate) fn longest_pause(ws: &[W]) -> Option<usize> {
 /// A last word the end-of-turn head may still close: no . ? ! or a plain full stop (not "..."). Not Khmer: its chat
 /// style has no mark at the end of a message (and no "...").
 pub(crate) fn open_end(w: &str, lang: &crate::model::LangInfo) -> bool {
-    lang.code != "km" && (!is_end(w) || (w.ends_with(end_mark(lang)) && !w.ends_with("...")))
+    lang.code != "km" && (!is_end(w, lang) || (w.ends_with(end_mark(lang)) && !w.ends_with("...")))
 }
 
 /// The last word of the audio closed: a full stop if the speaker had finished, else "..." (a full stop taken off).
 pub(crate) fn close(w: &str, finished: bool, lang: &crate::model::LangInfo) -> String {
-    let base = trim_trail(w.trim_end_matches(end_mark(lang)));
+    let base = trim_trail(w.trim_end_matches(end_mark(lang)), lang);
     if finished { format!("{base}{}", end_mark(lang)) } else { format!("{base}...") }
 }
 

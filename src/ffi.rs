@@ -90,7 +90,7 @@ fn words(ws: &[Word], o: &mut String) {
 
 /// Events as a JSON array: {"type": "commit", "words": [...]}, {"type": "partial", "open": [...], "tail": [...]},
 /// {"type": "language", "lang": "en"}, {"type": "eou", "at": s, "p": P}; a word is {"text", "start", "end"} plus "join": true when it is written without a
-/// space before it (Khmer syllables).
+/// space before it (Khmer syllables, Chinese characters).
 pub fn events_json(ev: &[Event]) -> String {
     let mut o = String::from("[");
     for (i, e) in ev.iter().enumerate() {

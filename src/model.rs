@@ -7,7 +7,7 @@
 //!   carrying the attention keys/values, the nonlinear-attention input and the convolution tails between chunks,
 //!   as icefall's `streaming_forward` and the sherpa-onnx export do.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -167,9 +167,11 @@ impl<'a> Tensors<'a> {
             b"TZF1" => (false, false),
             b"TZF2" => (true, false),
             // TZF4 (tinyasr 4): TZF3 + lang_dec (a version 3 library refuses it); TZF5 (tinyasr 5): may set
-            // "first_block_all" = 0, which a version 4 library would ignore and decode wrongly, so it refuses TZF5
-            b"TZF3" | b"TZF4" | b"TZF5" => (true, true),
-            _ => return Err("not a tinyasr model file (TZF1/TZF2/TZF3/TZF4/TZF5)"),
+            // "first_block_all" = 0, which a version 4 library would ignore and decode wrongly, so it refuses TZF5;
+            // TZF6 (tinyasr 6): the writing rules "lang.K.units" / "lang.K.ends" / "lang.K.trim" (Chinese: one unit per
+            // character, 。？！ end a sentence), which a version 5 library would ignore (a sentence as one word)
+            b"TZF3" | b"TZF4" | b"TZF5" | b"TZF6" => (true, true),
+            _ => return Err("not a tinyasr model file (TZF1/TZF2/TZF3/TZF4/TZF5/TZF6)"),
         };
         let mut cfg = BTreeMap::new();
         for _ in 0..r.u32()? {
@@ -1172,7 +1174,8 @@ pub struct Model {
 }
 
 /// A language of the model: its code and how its text is written, all from the model file (TZF3: "lang.K" = code,
-/// "lang.K.full_stop", "lang.K.quotes", "lang.K.own", "lang.K.syllables"; older files: [`legacy_langs`]).
+/// "lang.K.full_stop", "lang.K.quotes", "lang.K.own", "lang.K.syllables"; TZF6: "lang.K.units", "lang.K.ends",
+/// "lang.K.trim"; older files: [`legacy_langs`]).
 pub struct LangInfo {
     pub code: String,
     /// `code` NUL-terminated (the C API hands it out).
@@ -1183,13 +1186,29 @@ pub struct LangInfo {
     pub quotes: Option<(char, char)>,
     /// Letters of the shared token block only this language may write (another language's tokens with them are left out).
     pub own: String,
-    /// Words with Khmer letters come out as timed syllables (Khmer writes no spaces inside a phrase).
-    pub syllables: bool,
+    /// The timed units of a word ("lang.K.units": "word", "char", "khmer"; the TZF3 "lang.K.syllables" = 1 is Khmer).
+    pub units: Units,
+    /// Marks that end a sentence besides . ? ! … ។ ؟ ("lang.K.ends", Chinese 。？！).
+    pub ends: String,
+    /// Trailing marks dropped before an added full stop besides , ; : — – - ، ؛ ("lang.K.trim", Chinese ，、；：).
+    pub trim: String,
+}
+
+/// How a word is cut into timed units for the output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Units {
+    /// Whole words (spaces between words).
+    Word,
+    /// One unit per character of a script written without spaces (Chinese).
+    Char,
+    /// Khmer syllables (no spaces inside a phrase).
+    Khmer,
 }
 
 impl LangInfo {
     pub(crate) fn new(code: &str) -> LangInfo {
-        LangInfo { code: code.into(), code0: format!("{code}\0"), full_stop: '.', quotes: None, own: String::new(), syllables: false }
+        LangInfo { code: code.into(), code0: format!("{code}\0"), full_stop: '.', quotes: None, own: String::new(), units: Units::Word,
+                   ends: String::new(), trim: String::new() }
     }
 }
 
@@ -1212,7 +1231,7 @@ fn legacy_langs(w: &Tensors, n: usize) -> R<Vec<LangInfo>> {
             let mut l = LangInfo::new(c);
             match c {
                 "uk" => l.own = "ґҐ".into(),
-                "km" => (l.full_stop, l.quotes, l.syllables) = ('។', Some(('“', '”')), true),
+                "km" => (l.full_stop, l.quotes, l.units) = ('។', Some(('“', '”')), Units::Khmer),
                 _ => {}
             }
             l
@@ -1233,7 +1252,19 @@ fn file_langs(w: &Tensors, n: usize) -> R<Vec<LangInfo>> {
                 Some((c.next()?, c.next()?))
             });
             l.own = w.text.get(&format!("lang.{k}.own")).cloned().unwrap_or_default();
-            l.syllables = w.cfg.get(&format!("lang.{k}.syllables")).is_some_and(|&v| v != 0);
+            // Khmer files (en-km) set only the TZF3 syllable flag; a TZF6 file names its units
+            if w.cfg.get(&format!("lang.{k}.syllables")).is_some_and(|&v| v != 0) {
+                l.units = Units::Khmer;
+            }
+            match w.text.get(&format!("lang.{k}.units")).map(String::as_str) {
+                Some("char") => l.units = Units::Char,
+                Some("khmer") => l.units = Units::Khmer,
+                Some("word") => l.units = Units::Word,
+                Some(_) => return Err("model file: unknown lang.K.units"),
+                None => {}
+            }
+            l.ends = w.text.get(&format!("lang.{k}.ends")).cloned().unwrap_or_default();
+            l.trim = w.text.get(&format!("lang.{k}.trim")).cloned().unwrap_or_default();
             Ok(l)
         })
         .collect()
@@ -1440,15 +1471,18 @@ impl Model {
         let first_all = w.cfg.get("first_block_all").is_none_or(|&v| v != 0);
         let out = (0..n as u32)
             .map(|k| {
-                // shared block + English; a shared piece with a letter some language owns (ґ: Ukrainian; reserved ids,
-                // tok_dir/extra.json) only for the languages that own it
-                let own = &langs[k as usize].own;
-                let other = |c: char| !own.contains(c) && langs.iter().any(|l| l.own.contains(c));
+                // shared block + English + the language's own block; a piece with a letter another language owns (ґ:
+                // Ukrainian; TZF6 Chinese: zh owns the Simplified-only characters, zh_tw the Traditional-only ones, so
+                // each code writes one script) only for the languages that own it
+                let mine: BTreeSet<char> = langs[k as usize].own.chars().collect();
+                let theirs: BTreeSet<char> = langs.iter().flat_map(|l| l.own.chars()).filter(|c| !mine.contains(c)).collect();
                 let first = if first_all || k == 0 { shared + size } else { shared };
-                let mut ids: Vec<u32> =
-                    (0..first).filter(|&i| i >= shared || !w.pieces.get(i as usize).is_some_and(|p| p.chars().any(other))).collect();
+                let mut ids: Vec<u32> = (0..first).collect();
                 if k != 0 {
                     ids.extend(shared + k * size..shared + (k + 1) * size);
+                }
+                if !theirs.is_empty() {
+                    ids.retain(|&i| !w.pieces.get(i as usize).is_some_and(|p| p.chars().any(|c| theirs.contains(&c))));
                 }
                 let lw = match &jw {
                     Ok(q) => Weight::I8(QuantF::new(ids.len(), jdim, |j, p| q.code(ids[j] as usize, p), |j| q.scale(ids[j] as usize, 0))),
