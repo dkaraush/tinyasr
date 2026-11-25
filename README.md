@@ -46,6 +46,8 @@ WER %, second pass (beam 4) / streaming (greedy)
 |  |  | Malay | 7.98 / 10.01 | — |
 | `fr-de` (62M) | 30.8 MiB | French | 8.35 / 9.82 | 13.63 / 15.21 |
 |  |  | German | 6.88 / 7.96 | 9.30 / 10.20 |
+| `zh` (67M) | 35.5 MiB | Chinese (Simplified) (CER) | 9.16 | 12.57 |
+|  |  | Chinese (Traditional) (CER) | 9.04 | — |
 
 ### License
 
