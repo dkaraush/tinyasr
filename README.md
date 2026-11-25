@@ -9,7 +9,7 @@ Demo at: https://dkaraush.github.io/tinyasr/web/
 - Punctuation, capitalization and word timestamps.
 - Live streaming with re-decodes of the open sentence, or a full-context pass over a finished recording.
 - Built-in Silero VAD and end-of-turn head.
-- SIMD on ARM (`i8mm`, `dotprod`, plain NEON), x86_64 (AVX-512 VNNI, AVX-VNNI or AVX2), and WASM (SIMD128; relaxed SIMD); int4 weights stay int4 in memory (~46 MB loaded for a 38 MB model).
+- SIMD on ARM (`i8mm`, `dotprod`, plain NEON), x86_64 (AVX-512 VNNI, AVX-VNNI, AVX2 or AVX), and WASM (SIMD128; relaxed SIMD); int4 weights stay int4 in memory (~46 MB loaded for a 38 MB model).
 - Multi-threading supported.
 - Zero dependencies.
 
